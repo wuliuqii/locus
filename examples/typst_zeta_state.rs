@@ -1,4 +1,4 @@
-//! Typst ζ demo state: compile the canonical validation formula and render extracted line shapes.
+//! Typst ζ demo state: compile the canonical validation formula and render extracted primitives.
 //!
 //! This is a **state-only** module (no `fn main()`), meant to be used by an example wrapper:
 //! - `examples/typst_zeta.rs` (thin wrapper) and/or by `src/main.rs` via `#[path = ...]`.
@@ -6,17 +6,17 @@
 //! Current scope (Phase A, incremental):
 //! - Compile the canonical math formula: `locus::typst::math::ZETA_VALIDATION_FORMULA`.
 //! - Traverse the resulting `PagedDocument` frames.
-//! - Extract only `Shape::Line(...)` items and render them as stroked rectangles (very thin quads)
-//!   into `Scene2D`.
+//! - Extract:
+//!   - `Shape::Line(...)` items and render them as stroked rectangles (very thin quads)
+//!   - `Text` items as **debug rectangles** (approximate), so we can validate layout without glyph outlines
 //!
 //! Non-goals (for now):
-//! - Text extraction and glyph outline rendering (next phase).
+//! - Glyph outline rendering (next phase).
 //! - Full shape geometry support beyond simple lines.
 //!
 //! Notes:
 //! - Typst's coordinate system here is page-local in `pt` units.
 //! - We accumulate `Group.transform` and item positions so rules render in correct locations.
-//! - This still only extracts simple `Shape::Line` geometry; text/glyphs are a later step.
 
 use std::{sync::Arc, time::Instant};
 
@@ -58,26 +58,37 @@ impl State {
         let compiled = locus::typst::engine::compile_zeta_validation()
             .context("typst: failed to compile ζ validation formula")?;
 
-        // Extract line shapes from the compiled document.
-        let mut mesh = Mesh2D::default();
+        // Extract primitives from the compiled document.
+        //
+        // - `line_mesh`: fraction bars / rule strokes (as thin quads)
+        // - `text_dbg_mesh`: approximate text rectangles (debug overlay)
+        let mut line_mesh = Mesh2D::default();
+        let mut text_dbg_mesh = Mesh2D::default();
+
         let mut stats = ExtractStats::default();
-        extract_line_shapes_into_mesh(&compiled.document, &mut mesh, &mut stats);
+        extract_primitives_into_meshes(
+            &compiled.document,
+            &mut line_mesh,
+            &mut text_dbg_mesh,
+            &mut stats,
+        );
 
         // Log extraction stats once at startup so `timeout ... cargo run --example typst_zeta`
         // still gives useful feedback even if the window is killed quickly.
         log::info!(
-            "typst_zeta: extracted lines={} groups={} shapes={} pages={}",
+            "typst_zeta: extracted lines={} text_dbg_rects={} groups={} shapes={} texts={} pages={}",
             stats.lines,
+            stats.text_debug_rects,
             stats.groups,
             stats.shapes,
+            stats.texts,
             compiled.document.pages.len()
         );
 
         // Add to scene (world/local are in pt).
-        // We draw the extracted "rules" in a bright color to make them obvious.
         scene.add_root(
             Mobject2D::new("typst_lines")
-                .with_mesh(mesh)
+                .with_mesh(line_mesh)
                 .with_fill(Rgba {
                     r: 0.90,
                     g: 0.90,
@@ -86,8 +97,27 @@ impl State {
                 }),
         );
 
-        // Frame the camera around the extracted geometry (if any).
-        if stats.lines > 0 {
+        // Debug overlay: approximate text boxes.
+        scene.add_root(
+            Mobject2D::new("typst_text_dbg")
+                .with_mesh(text_dbg_mesh)
+                .with_fill(Rgba {
+                    r: 0.30,
+                    g: 0.85,
+                    b: 0.95,
+                    a: 0.55,
+                }),
+        );
+
+        // Frame the camera around extracted geometry (prefer text overlay if present).
+        //
+        // This avoids framing around a single thin rule which can feel "too zoomed in".
+        if stats.text_debug_rects > 0 {
+            if let Some(root) = scene.get("typst_text_dbg") {
+                let bounds = root.compute_local_bounds();
+                scene.camera.frame_bounds(bounds, 60.0, 0.85);
+            }
+        } else if stats.lines > 0 {
             if let Some(root) = scene.get("typst_lines") {
                 let bounds = root.compute_local_bounds();
                 // Conservative padding; rules can be thin so give it some breathing room.
@@ -208,54 +238,83 @@ struct ExtractStats {
     pages: usize,
     groups: usize,
     shapes: usize,
+    texts: usize,
+
     lines: usize,
+    text_debug_rects: usize,
 }
 
-/// Extract `Shape::Line` items from the document and append them to a single `Mesh2D`.
+/// Extract primitives from the document and append them to two meshes:
+/// - `line_out`: stroked rules (currently only `Geometry::Line`)
+/// - `text_dbg_out`: approximate debug boxes for text items
 ///
 /// Implementation notes:
-/// - We walk each page frame recursively (FrameItem::Group, FrameItem::Shape).
+/// - We walk each page frame recursively (FrameItem::Group, FrameItem::Shape, FrameItem::Text).
 /// - We **accumulate group transforms and item positions** into a single affine transform.
-/// - We approximate a stroked line as a thin rectangle (two triangles).
-fn extract_line_shapes_into_mesh(
+/// - Debug text boxes are approximate and intentionally conservative (to visualize layout).
+fn extract_primitives_into_meshes(
     doc: &layout::PagedDocument,
-    out: &mut Mesh2D,
+    line_out: &mut Mesh2D,
+    text_dbg_out: &mut Mesh2D,
     stats: &mut ExtractStats,
 ) {
     stats.pages = doc.pages.len();
 
     for page in &doc.pages {
-        // In typst 0.14, Page has `frame`.
         let frame = &page.frame;
-
-        // Start each page at identity transform (page-local coordinates).
-        walk_frame_for_lines(frame, Affine2::IDENTITY, out, stats);
+        walk_frame_for_primitives(frame, Affine2::IDENTITY, line_out, text_dbg_out, stats);
     }
 }
 
-fn walk_frame_for_lines(
+fn walk_frame_for_primitives(
     frame: &layout::Frame,
     world_from_frame: Affine2,
-    out: &mut Mesh2D,
+    line_out: &mut Mesh2D,
+    text_dbg_out: &mut Mesh2D,
     stats: &mut ExtractStats,
 ) {
     for (pos, item) in frame.items() {
         match item {
             layout::FrameItem::Group(group) => {
                 stats.groups += 1;
-                // Compose: parent(frame) * group.transform
                 let world_from_group =
                     world_from_frame.mul(affine2_from_typst_transform(group.transform));
-                walk_frame_for_lines(&group.frame, world_from_group, out, stats);
+                walk_frame_for_primitives(
+                    &group.frame,
+                    world_from_group,
+                    line_out,
+                    text_dbg_out,
+                    stats,
+                );
             }
             layout::FrameItem::Shape(shape, _span) => {
                 stats.shapes += 1;
-                // Compose: parent(frame) * translate(item_pos)
                 let world_from_item = world_from_frame.mul(Affine2::translate(
                     pos.x.to_pt() as f32,
                     pos.y.to_pt() as f32,
                 ));
-                extract_shape_lines(world_from_item, shape, out, stats);
+                extract_shape_lines(world_from_item, shape, line_out, stats);
+            }
+            layout::FrameItem::Text(_text) => {
+                // Typst text items are shaped runs, but the public API surface doesn't expose
+                // reliable glyph boxes for all versions. For Phase A layout debugging, we draw
+                // a conservative placeholder rectangle at the text position.
+                //
+                // This still answers the key question: "where did Typst place text items?"
+                stats.texts += 1;
+
+                let world_from_item = world_from_frame.mul(Affine2::translate(
+                    pos.x.to_pt() as f32,
+                    pos.y.to_pt() as f32,
+                ));
+
+                // Conservative box size (pt). This is intentionally "visible" rather than accurate.
+                // We'll replace this with real glyph boxes once we wire text shaping data.
+                let w = 6.0f32;
+                let h = 10.0f32;
+
+                append_axis_aligned_rect_transformed(text_dbg_out, world_from_item, w, h);
+                stats.text_debug_rects += 1;
             }
             _ => {}
         }
@@ -269,18 +328,11 @@ fn extract_shape_lines(
     stats: &mut ExtractStats,
 ) {
     // We only support `geometry: Line(...)` for now.
-    // In the log output you already saw something like:
-    // Shape { geometry: Line(Point(...)), stroke: Some(FixedStroke { thickness: ... }) }
     if let visualize::Geometry::Line(delta) = &shape.geometry {
-        // In Typst, the line geometry is specified as a delta from the item's local origin.
-        // We render it by transforming two points:
-        // - start at (0, 0)
-        // - end at (delta.x, delta.y)
         let (x0, y0) = world_from_item.transform_point(0.0, 0.0);
         let (x1, y1) =
             world_from_item.transform_point(delta.x.to_pt() as f32, delta.y.to_pt() as f32);
 
-        // Thickness: if the shape has a stroke, use its thickness; else a small default.
         let thickness_pt = shape
             .stroke
             .as_ref()
@@ -325,6 +377,32 @@ fn append_line_as_rect(mesh: &mut Mesh2D, a: [f32; 2], b: [f32; 2], thickness_pt
     mesh.positions.extend_from_slice(&[p0, p1, p2, p3]);
 
     // Two triangles: (0,1,2) and (0,2,3)
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// Append an axis-aligned rectangle centered at the item's local origin, transformed by `world_from_item`.
+///
+/// This is used for **debug text boxes**. The rectangle is:
+/// - centered at (0, 0) in item-local space
+/// - width `w_pt`, height `h_pt` in pt
+fn append_axis_aligned_rect_transformed(
+    mesh: &mut Mesh2D,
+    world_from_item: Affine2,
+    w_pt: f32,
+    h_pt: f32,
+) {
+    let hw = 0.5 * w_pt;
+    let hh = 0.5 * h_pt;
+
+    let (x0, y0) = world_from_item.transform_point(-hw, -hh);
+    let (x1, y1) = world_from_item.transform_point(hw, -hh);
+    let (x2, y2) = world_from_item.transform_point(hw, hh);
+    let (x3, y3) = world_from_item.transform_point(-hw, hh);
+
+    let base = mesh.positions.len() as u16;
+    mesh.positions
+        .extend_from_slice(&[[x0, y0], [x1, y1], [x2, y2], [x3, y3]]);
     mesh.indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
