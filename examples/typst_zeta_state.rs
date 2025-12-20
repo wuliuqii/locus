@@ -17,6 +17,8 @@
 //! Notes:
 //! - Typst's coordinate system here is page-local in `pt` units.
 //! - We accumulate `Group.transform` and item positions so rules render in correct locations.
+//! - Text item internals are version-sensitive; we log a debug representation once (rate-limited)
+//!   and derive better debug boxes when possible.
 
 use std::{sync::Arc, time::Instant};
 
@@ -30,9 +32,9 @@ use locus::{
 
 // In this file we need Typst's public types (`layout`, `visualize`).
 // The `locus::typst` module is our integration layer, but it doesn't re-export these namespaces.
-use typst::{layout, visualize};
+use typst::{layout, text::TextItem, visualize};
 
-/// Demo state for "Typst ζ → extract line shapes → render".
+/// Demo state for "Typst ζ → extract primitives → render".
 pub struct State {
     pub window: Arc<Window>,
     pub gpu: Gpu,
@@ -43,6 +45,10 @@ pub struct State {
     // Simple camera animation (optional).
     start_time: Instant,
     base_zoom: f32,
+
+    // Debug: log the first few Text items once so we can learn the public surface of typst 0.14's
+    // `layout::TextItem` on this build and decide what we can use for better debug boxes.
+    text_debug_logged: usize,
 }
 
 impl State {
@@ -66,11 +72,16 @@ impl State {
         let mut text_dbg_mesh = Mesh2D::default();
 
         let mut stats = ExtractStats::default();
+
+        // Extract once with logging enabled for a small number of Text items.
+        // This is intentionally bounded so `timeout ... cargo run --example typst_zeta` remains usable.
+        let mut text_debug_logged = 0usize;
         extract_primitives_into_meshes(
             &compiled.document,
             &mut line_mesh,
             &mut text_dbg_mesh,
             &mut stats,
+            &mut text_debug_logged,
         );
 
         // Log extraction stats once at startup so `timeout ... cargo run --example typst_zeta`
@@ -135,6 +146,7 @@ impl State {
             renderer,
             start_time: Instant::now(),
             base_zoom,
+            text_debug_logged,
         })
     }
 
@@ -257,12 +269,20 @@ fn extract_primitives_into_meshes(
     line_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
     stats: &mut ExtractStats,
+    text_debug_logged: &mut usize,
 ) {
     stats.pages = doc.pages.len();
 
     for page in &doc.pages {
         let frame = &page.frame;
-        walk_frame_for_primitives(frame, Affine2::IDENTITY, line_out, text_dbg_out, stats);
+        walk_frame_for_primitives(
+            frame,
+            Affine2::IDENTITY,
+            line_out,
+            text_dbg_out,
+            stats,
+            text_debug_logged,
+        );
     }
 }
 
@@ -272,6 +292,7 @@ fn walk_frame_for_primitives(
     line_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
     stats: &mut ExtractStats,
+    text_debug_logged: &mut usize,
 ) {
     for (pos, item) in frame.items() {
         match item {
@@ -285,6 +306,7 @@ fn walk_frame_for_primitives(
                     line_out,
                     text_dbg_out,
                     stats,
+                    text_debug_logged,
                 );
             }
             layout::FrameItem::Shape(shape, _span) => {
@@ -295,23 +317,26 @@ fn walk_frame_for_primitives(
                 ));
                 extract_shape_lines(world_from_item, shape, line_out, stats);
             }
-            layout::FrameItem::Text(_text) => {
-                // Typst text items are shaped runs, but the public API surface doesn't expose
-                // reliable glyph boxes for all versions. For Phase A layout debugging, we draw
-                // a conservative placeholder rectangle at the text position.
-                //
-                // This still answers the key question: "where did Typst place text items?"
+            layout::FrameItem::Text(text) => {
+                // For Phase A layout debugging, we draw a debug rectangle for each text item.
+                // Additionally, we log the debug representation of the first few text items
+                // (rate-limited) so we can discover which public fields are available in typst 0.14
+                // and improve these boxes.
                 stats.texts += 1;
+
+                if *text_debug_logged < 6 {
+                    log::info!("typst_zeta: Text item debug: {:?}", text);
+                    *text_debug_logged += 1;
+                }
 
                 let world_from_item = world_from_frame.mul(Affine2::translate(
                     pos.x.to_pt() as f32,
                     pos.y.to_pt() as f32,
                 ));
 
-                // Conservative box size (pt). This is intentionally "visible" rather than accurate.
-                // We'll replace this with real glyph boxes once we wire text shaping data.
-                let w = 6.0f32;
-                let h = 10.0f32;
+                // Try to derive a better debug box from the text item.
+                // If we can't, fall back to a conservative visible placeholder.
+                let (w, h) = derive_text_debug_box_size(text).unwrap_or((6.0f32, 10.0f32));
 
                 append_axis_aligned_rect_transformed(text_dbg_out, world_from_item, w, h);
                 stats.text_debug_rects += 1;
@@ -405,6 +430,87 @@ fn append_axis_aligned_rect_transformed(
         .extend_from_slice(&[[x0, y0], [x1, y1], [x2, y2], [x3, y3]]);
     mesh.indices
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// Best-effort derivation of a debug box size from a Typst `TextItem`.
+///
+/// Typst's `TextItem` is intentionally opaque for our Phase A bring-up. We don't have stable,
+/// public access to per-glyph boxes here yet, so we use conservative heuristics.
+///
+/// Goal:
+/// - Make the debug rectangles visually reflect the *relative* visual weight of items
+///   (e.g. "∑" should be larger than "(").
+/// - Avoid relying on unstable internal fields.
+/// - Keep it deterministic and cheap.
+///
+/// This is a stepping stone towards real glyph outline rendering.
+fn derive_text_debug_box_size(text: &TextItem) -> Option<(f32, f32)> {
+    // We observed (via logged Debug output) that `TextItem` formats like:
+    //   Text("𝜁")
+    //   Text("(")
+    //   Text("∑")
+    //
+    // We therefore use `Debug` as a stable-ish extraction mechanism for now.
+    //
+    // NOTE: This is *not* meant to be perfect; it just makes the overlay more informative.
+    let s = format!("{:?}", text);
+
+    // Extract the content inside `Text("...")` if possible.
+    let content = s
+        .strip_prefix("Text(\"")
+        .and_then(|rest| rest.strip_suffix("\")"));
+
+    let content = match content {
+        Some(c) => c,
+        None => return None,
+    };
+
+    let mut w = 6.0f32;
+    let mut h = 10.0f32;
+
+    // Base sizing by number of Unicode scalar values (good enough for our symbols).
+    let n = content.chars().count().max(1) as f32;
+    w = 5.0 * n;
+    h = 10.0;
+
+    // Per-symbol tweaks (heuristic).
+    // These are chosen to be visually distinctive for our validation formula.
+    match content {
+        "∑" => {
+            w = 16.0;
+            h = 22.0;
+        }
+        "=" => {
+            w = 12.0;
+            h = 6.0;
+        }
+        "(" | ")" => {
+            w = 5.0;
+            h = 14.0;
+        }
+        // italic math letters (𝑠, etc.) and zeta variant tend to be taller than punctuation.
+        "𝜁" | "𝑠" | "n" | "s" => {
+            w = 8.0;
+            h = 14.0;
+        }
+        // Common digits used in subscript/superscript.
+        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+            w = 6.0;
+            h = 10.0;
+        }
+        _ => {
+            // Multi-character tokens (rare in our current formula) get a slightly taller box.
+            if n > 1.0 {
+                h = 12.0;
+            }
+        }
+    }
+
+    // Clamp to reasonable bounds so weird glyphs don't explode the view.
+    w = w.clamp(3.0, 40.0);
+    h = h.clamp(4.0, 40.0);
+
+    Some((w, h))
 }
 
 /// Convert a Typst `Transform` into our `scene::Affine2`.
