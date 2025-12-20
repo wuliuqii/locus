@@ -9,3 +9,29 @@ wgpu = "28.0.0"
 env_logger = "0.11"
 log = "0.4"
 pollster = "0.4"
+bytemuck = { version = "1.14", features = ["derive"] }
+glam = "0.29"
+lyon = "1.0"
+
+# Typst parsing (for parsing `#rect(...)` and reading its arguments from the AST)
+typst-syntax = "0.14"
+typst-utils = "0.14"
+ecow = "0.2"
+
+# Typst engine: evaluate + layout into Frames (text, math, shapes)
+typst = "0.14"
+
+# Typst compilation infrastructure (needed for implementing a custom World)
+comemo = "0.4"
+typst-assets = "0.14"
+
+# Font discovery & parsing (vector outlines)
+fontdb = "0.21"
+ttf-parser = "0.20"
+
+# Optional helpers you'll likely want soon:
+# - once_cell: global fontdb cache
+# - anyhow: ergonomic error handling while bootstrapping the pipeline
+once_cell = "1.19"
+anyhow = "1.0"
+thiserror = "1.0"
