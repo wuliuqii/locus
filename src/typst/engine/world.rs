@@ -1,7 +1,7 @@
 //! Minimal Typst `World` implementation (first pass).
 //!
 //! Goal (Phase A, Strategy B):
-//! - Compile an in-memory Typst source (math-only) using **our own** system font discovery.
+//! - Compile an in-memory Typst source (math-only) with a **controlled** font provisioning strategy.
 //! - Provide:
 //!   - `library()`
 //!   - `book()` (FontBook)
@@ -9,12 +9,15 @@
 //!   - `main()` and `source(main)`
 //! - Keep everything deterministic and self-contained (no package resolution yet).
 //!
-//! Design notes:
-//! - Fonts are discovered through `fontdb` (system fonts).
-//! - Font data is loaded from disk into memory once and exposed to Typst via `font(index)`.
-//! - `FontBook` is built from the loaded `Font`s so Typst can select faces.
-//! - This is intentionally a *first-pass* implementation: no file imports, no packages,
-//!   no binary assets, no caching across multiple documents (yet).
+//! Design notes (updated):
+//! - Phase A default is **typst-assets only** (no system scan), which is more stable and reduces
+//!   runtime pressure from enumerating / reading many system fonts.
+//! - Optionally, you can enable a constrained system-font load by specifying a small set of
+//!   candidate family names (e.g. STIX / Libertine / Latin Modern) plus fallback.
+//!
+//! Diagnostics note:
+//! - When compilation fails, prefer rich diagnostics (with spans) over dumping raw sources.
+//!   We attempt to format `SourceDiagnostic`s into a readable string for debugging.
 //!
 //! Implementation constraints:
 //! - `typst` wants:
@@ -29,7 +32,7 @@ use ecow::EcoString;
 use fontdb::{Database, Source as FontSource};
 use typst::{
     Library, LibraryExt,
-    diag::{FileError, FileResult},
+    diag::{FileError, FileResult, SourceDiagnostic},
     foundations::{Bytes, Datetime},
     syntax::{FileId, Source as TypstSource, VirtualPath},
     text::{Font, FontBook},
@@ -58,7 +61,7 @@ impl InMemoryDoc {
 ///
 /// - Single in-memory main file.
 /// - No filesystem reads for sources beyond the main file.
-/// - System fonts discovered via fontdb and loaded from disk.
+/// - Fonts are provisioned according to `FontLoadingStrategy`.
 pub struct TypstWorld {
     doc: Arc<InMemoryDoc>,
     main: FileId,
@@ -90,12 +93,17 @@ pub struct TypstWorld {
 impl TypstWorld {
     /// Create a world from a single in-memory Typst source.
     ///
-    /// This will:
-    /// - create a `FileId` for the virtual main file
-    /// - load system fonts via `fontdb`
-    /// - read font bytes and parse into `typst::text::Font`
-    /// - build a `FontBook`
+    /// Default behavior (Phase A):
+    /// - Use `typst-assets` fonts only (no system scan).
+    ///
+    /// This is usually sufficient for math (e.g. ζ) and avoids loading a huge number
+    /// of system fonts at startup.
     pub fn new(doc: InMemoryDoc) -> anyhow::Result<Self> {
+        Self::new_with_fonts(doc, FontLoadingStrategy::TypstAssetsOnly)
+    }
+
+    /// Create a world with an explicit font loading strategy.
+    pub fn new_with_fonts(doc: InMemoryDoc, strategy: FontLoadingStrategy) -> anyhow::Result<Self> {
         // Create a deterministic FileId for our in-memory main file.
         //
         // typst-syntax 0.14 expects:
@@ -105,8 +113,7 @@ impl TypstWorld {
         // Library: use the built-in Typst standard library.
         let library = LazyHash::new(Library::default());
 
-        // Fonts: discover and load system fonts.
-        let (fonts, font_data, book) = load_system_fonts_into_typst()?;
+        let (fonts, font_data, book) = load_fonts_into_typst(strategy)?;
 
         Ok(Self {
             doc: Arc::new(doc),
@@ -125,26 +132,83 @@ impl TypstWorld {
     }
 }
 
-/// Load system fonts via `fontdb`, parse them into `typst::text::Font`, and build a `FontBook`.
+/// Controls how fonts are provisioned to Typst.
 ///
-/// Notes:
-/// - We only support file-backed fonts (`Source::File`) here.
-/// - We attempt to load as many fonts as possible; parse failures are skipped.
-/// - We *do not* do any custom fallback logic here; Typst will use the FontBook.
-fn load_system_fonts_into_typst() -> anyhow::Result<(Vec<Font>, Vec<Arc<[u8]>>, FontBook)> {
-    let mut db = Database::new();
-    db.load_system_fonts();
+/// Phase A default is `TypstAssetsOnly` to keep runtime steady and deterministic.
+#[derive(Debug, Clone)]
+pub enum FontLoadingStrategy {
+    /// Load only embedded fonts from `typst-assets` (no system scan).
+    TypstAssetsOnly,
 
+    /// Load only a small set of system font families (by name), plus `typst-assets` fallback.
+    ///
+    /// This is useful if you want to prefer a known math/text family (e.g. STIX, Libertine,
+    /// Latin Modern) but avoid loading every system font.
+    LimitedSystemFamilies {
+        /// Candidate family names in priority order (case-insensitive match on `fontdb` families).
+        families: Vec<String>,
+    },
+
+    /// Load all system fonts (previous behavior), with `typst-assets` fallback.
+    LoadAllSystemFonts,
+}
+
+fn load_fonts_into_typst(
+    strategy: FontLoadingStrategy,
+) -> anyhow::Result<(Vec<Font>, Vec<Arc<[u8]>>, FontBook)> {
     let mut fonts: Vec<Font> = Vec::new();
     let mut font_data: Vec<Arc<[u8]>> = Vec::new();
 
-    // Load file-backed fonts.
+    match strategy {
+        FontLoadingStrategy::TypstAssetsOnly => {
+            load_typst_assets_fonts(&mut fonts, &mut font_data);
+        }
+        FontLoadingStrategy::LimitedSystemFamilies { families } => {
+            load_system_fonts_filtered_into_typst(&families, &mut fonts, &mut font_data);
+            if fonts.is_empty() {
+                load_typst_assets_fonts(&mut fonts, &mut font_data);
+            }
+        }
+        FontLoadingStrategy::LoadAllSystemFonts => {
+            load_all_system_fonts_into_typst(&mut fonts, &mut font_data);
+            if fonts.is_empty() {
+                load_typst_assets_fonts(&mut fonts, &mut font_data);
+            }
+        }
+    }
+
+    if fonts.is_empty() {
+        anyhow::bail!("no fonts could be loaded (strategy produced zero usable fonts)");
+    }
+
+    let book = FontBook::from_fonts(fonts.iter());
+    Ok((fonts, font_data, book))
+}
+
+fn load_typst_assets_fonts(fonts: &mut Vec<Font>, font_data: &mut Vec<Arc<[u8]>>) {
+    // `typst_assets::fonts()` yields borrowed font bytes. We must *own* the bytes to satisfy
+    // Typst's `'static` requirement for `Bytes::new(...)`.
     //
-    // `fontdb` can yield faces that come from:
-    // - Source::File(PathBuf)
-    // - Source::Binary(Arc<[u8]>)
-    //
-    // For first pass, we only handle Source::File.
+    // Important: We must copy the bytes out of the iterator item (e.g. `&'static [u8]`)
+    // into an owned buffer, then keep that buffer alive in `font_data`.
+    for data in typst_assets::fonts() {
+        // Be explicit about the slice type to help inference.
+        let data: &[u8] = data;
+
+        let owned: Arc<[u8]> = Arc::from(data.to_vec());
+        let bytes = Bytes::new(owned.clone());
+
+        if let Some(font) = Font::new(bytes, 0) {
+            font_data.push(owned);
+            fonts.push(font);
+        }
+    }
+}
+
+fn load_all_system_fonts_into_typst(fonts: &mut Vec<Font>, font_data: &mut Vec<Arc<[u8]>>) {
+    let mut db = Database::new();
+    db.load_system_fonts();
+
     for face in db.faces() {
         let (path, index) = match &face.source {
             FontSource::File(p) => (p.clone(), face.index),
@@ -156,13 +220,7 @@ fn load_system_fonts_into_typst() -> anyhow::Result<(Vec<Font>, Vec<Arc<[u8]>>, 
             Err(_) => continue,
         };
 
-        // Make font bytes `'static` by owning them in an Arc.
         let owned: Arc<[u8]> = Arc::from(bytes);
-
-        // Parse font for this face index inside file/collection.
-        //
-        // In typst 0.14, `Bytes::new(...)` requires owned `'static` backing storage.
-        // By passing an `Arc<[u8]>`, we satisfy that requirement.
         let bytes = Bytes::new(owned.clone());
         let font = Font::new(bytes, index);
 
@@ -171,37 +229,67 @@ fn load_system_fonts_into_typst() -> anyhow::Result<(Vec<Font>, Vec<Arc<[u8]>>, 
             fonts.push(font);
         }
     }
+}
 
-    // As a fallback, ensure we have at least some fonts by loading Typst's built-in font set.
-    // `typst-assets` provides embedded fonts used by Typst itself.
-    //
-    // This is still consistent with "Strategy B" (we control font provisioning) and makes the
-    // project robust on minimal systems/containers.
-    if fonts.is_empty() {
-        for data in typst_assets::fonts() {
-            // Make font bytes `'static` by owning them in an Arc.
-            let owned: Arc<[u8]> = Arc::from(data);
+fn load_system_fonts_filtered_into_typst(
+    families: &[String],
+    fonts: &mut Vec<Font>,
+    font_data: &mut Vec<Arc<[u8]>>,
+) {
+    let mut db = Database::new();
+    db.load_system_fonts();
 
-            let bytes = Bytes::new(owned.clone());
-            if let Some(font) = Font::new(bytes, 0) {
-                font_data.push(owned);
-                fonts.push(font);
-            }
+    if families.is_empty() {
+        return;
+    }
+
+    // Build a list of wanted family names (trimmed). We match case-insensitively.
+    let mut wanted: Vec<String> = Vec::new();
+    for fam in families {
+        let s = fam.trim();
+        if !s.is_empty() {
+            wanted.push(s.to_string());
         }
     }
 
-    if fonts.is_empty() {
-        anyhow::bail!("no fonts could be loaded (system fonts + typst-assets fallback failed)");
+    if wanted.is_empty() {
+        return;
     }
 
-    // Build the font book.
-    //
-    // `FontBook::from_fonts` expects an iterator over `Font`s.
-    // We keep the resulting book aligned with the vector order, so `font(index)` returns
-    // the corresponding `Font`.
-    let book = FontBook::from_fonts(fonts.iter());
+    // Iterate all discovered faces, but only load bytes for faces whose family matches.
+    // This avoids `Database::retain_faces` (not available in fontdb 0.21) while still
+    // preventing the expensive part: reading/parsing tons of font files.
+    for face in db.faces() {
+        // In fontdb 0.21, a face can have multiple family names (e.g. localized / aliases).
+        // We accept the face if *any* of its family names matches our wanted list.
+        let family_matches = face
+            .families
+            .iter()
+            .any(|(name, _)| wanted.iter().any(|w| name.eq_ignore_ascii_case(w)));
 
-    Ok((fonts, font_data, book))
+        if !family_matches {
+            continue;
+        }
+
+        let (path, index) = match &face.source {
+            FontSource::File(p) => (p.clone(), face.index),
+            _ => continue,
+        };
+
+        let bytes = match fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let owned: Arc<[u8]> = Arc::from(bytes);
+        let bytes = Bytes::new(owned.clone());
+        let font = Font::new(bytes, index);
+
+        if let Some(font) = font {
+            font_data.push(owned);
+            fonts.push(font);
+        }
+    }
 }
 
 impl typst::World for TypstWorld {
@@ -255,10 +343,73 @@ pub fn compile_math_paged(snippet: &str) -> anyhow::Result<typst::layout::PagedD
     let warned = typst::compile::<typst::layout::PagedDocument>(&world);
 
     warned.output.map_err(|errs| {
+        let formatted = format_source_diagnostics_with_excerpt(snippet, &errs);
         anyhow::anyhow!(
-            "typst compile failed with {} error(s): {:?}",
+            "typst compile failed with {} error(s):\n{}",
             errs.len(),
-            errs
+            formatted
         )
     })
+}
+
+fn format_source_diagnostics(diags: &[SourceDiagnostic]) -> String {
+    format_source_diagnostics_with_excerpt("", diags)
+}
+
+fn format_source_diagnostics_with_excerpt(source: &str, diags: &[SourceDiagnostic]) -> String {
+    // `SourceDiagnostic` carries spans/hints/traces, but formatting helpers differ between
+    // Typst versions. We provide a best-effort formatter that is stable for debugging.
+    //
+    // Additionally, we try to print a short excerpt around the diagnostic span. In typst 0.14
+    // we do not have a stable public API to resolve `Span` into `file:line:col` here, so this
+    // excerpt is heuristic:
+    // - It prints the first N characters of the source, and
+    // - It always prints the raw span debug representation.
+    //
+    // Once we wire in Typst's diagnostic rendering utilities, we should replace this with a
+    // true span-to-source mapping and a precise caret highlight.
+    let mut out = String::new();
+
+    // Keep the excerpt short so logs remain readable.
+    const EXCERPT_CHARS: usize = 280;
+
+    for (i, d) in diags.iter().enumerate() {
+        use std::fmt::Write as _;
+        let _ = writeln!(out, "[{}] {:?}: {}", i + 1, d.severity, d.message);
+
+        if !d.hints.is_empty() {
+            let _ = writeln!(out, "    hints:");
+            for h in &d.hints {
+                let _ = writeln!(out, "      - {}", h);
+            }
+        }
+
+        if !d.trace.is_empty() {
+            let _ = writeln!(out, "    trace:");
+            for t in &d.trace {
+                let _ = writeln!(out, "      - {:?}", t);
+            }
+        }
+
+        // Best-effort excerpt (heuristic).
+        if !source.is_empty() {
+            let excerpt: String = source.chars().take(EXCERPT_CHARS).collect();
+            let truncated = source.chars().count() > EXCERPT_CHARS;
+            if truncated {
+                let _ = writeln!(
+                    out,
+                    "    source_excerpt(first {} chars): {:?}…",
+                    EXCERPT_CHARS, excerpt
+                );
+            } else {
+                let _ = writeln!(out, "    source_excerpt: {:?}", excerpt);
+            }
+        }
+
+        // We include the raw span identifier as a last resort. A richer "file:line:col"
+        // mapping can be added once we wire in Typst's diagnostic rendering utilities.
+        let _ = writeln!(out, "    span: {:?}", d.span);
+    }
+
+    out
 }

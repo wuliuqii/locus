@@ -23,7 +23,10 @@ typst = "0.14"
 
 # Typst compilation infrastructure (needed for implementing a custom World)
 comemo = "0.4"
-typst-assets = "0.14"
+
+# Embedded fonts used by Typst itself (stable Phase A baseline: no system scan required).
+# NOTE: `typst-assets` ships the actual embedded font bytes behind the `fonts` feature.
+typst-assets = { version = "0.14", features = ["fonts"] }
 
 # Font discovery & parsing (vector outlines)
 fontdb = "0.21"

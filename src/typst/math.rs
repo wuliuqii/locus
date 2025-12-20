@@ -23,7 +23,7 @@
 use crate::typst::MathScene;
 
 /// The canonical validation target for Phase A.
-pub const ZETA_VALIDATION_FORMULA: &str = r#"$\zeta(s) = \sum_{n=1}^{\infty} \frac{1}{n^s}$"#;
+pub const ZETA_VALIDATION_FORMULA: &str = r#"$zeta(s) = sum_(n=1)^(oo) frac(1, n^s)$"#;
 
 /// A minimal description of a "math-only request".
 ///
