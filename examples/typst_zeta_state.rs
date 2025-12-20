@@ -19,6 +19,10 @@
 //! - We accumulate `Group.transform` and item positions so rules render in correct locations.
 //! - Text item internals are version-sensitive; we log a debug representation once (rate-limited)
 //!   and derive better debug boxes when possible.
+//!
+//! Refinement:
+//! - Debug text boxes are now baseline-relative (not centered), and are scaled by an *inferred*
+//!   script level derived from group transforms (sub/superscripts tend to be downscaled by Typst).
 
 use std::{sync::Arc, time::Instant};
 
@@ -254,6 +258,72 @@ struct ExtractStats {
 
     lines: usize,
     text_debug_rects: usize,
+
+    // Debug-only: how many text items we classified as scripts (sub/sup) vs. normal.
+    text_script: usize,
+    text_normal: usize,
+}
+
+/// Extraction context carried through recursion.
+///
+/// Goal:
+/// - Provide a cheap, deterministic heuristic for detecting "script contexts"
+///   (sub/superscripts tend to be downscaled by Typst).
+///
+/// This is a stepping stone towards real glyph metrics extraction.
+#[derive(Debug, Default, Clone, Copy)]
+struct ExtractCtx {
+    /// 0 = normal, 1+ = likely sub/superscript nesting.
+    script_level: u8,
+}
+
+impl ExtractCtx {
+    fn with_group_transform(self, t: layout::Transform) -> Self {
+        // Heuristic: sub/superscripts are often scaled down (e.g. ~70%).
+        // We treat any significant downscale as "entering a script level".
+        let sx = t.sx.get() as f32;
+        let sy = t.sy.get() as f32;
+        let s = (sx.abs() + sy.abs()) * 0.5;
+
+        if s < 0.86 {
+            Self {
+                script_level: self.script_level.saturating_add(1),
+            }
+        } else {
+            self
+        }
+    }
+
+    fn script_scale(self) -> f32 {
+        // Apply a gentle downscale per inferred level.
+        // This is for debug overlays only.
+        match self.script_level {
+            0 => 1.0,
+            1 => 0.72,
+            _ => 0.62,
+        }
+    }
+}
+
+/// A baseline-relative debug rectangle description.
+///
+/// This makes text overlay easier to interpret:
+/// - `w_pt`: width
+/// - `above_baseline_pt`: height above baseline
+/// - `below_baseline_pt`: depth below baseline
+/// - `scale`: extra scale (e.g. script scaling)
+#[derive(Debug, Clone, Copy)]
+struct BaselineBox {
+    w_pt: f32,
+    above_baseline_pt: f32,
+    below_baseline_pt: f32,
+    scale: f32,
+}
+
+impl BaselineBox {
+    fn height_pt(self) -> f32 {
+        self.above_baseline_pt + self.below_baseline_pt
+    }
 }
 
 /// Extract primitives from the document and append them to two meshes:
@@ -273,11 +343,15 @@ fn extract_primitives_into_meshes(
 ) {
     stats.pages = doc.pages.len();
 
+    // Track script scaling based on transforms. We start at "normal" (level 0).
+    let ctx = ExtractCtx::default();
+
     for page in &doc.pages {
         let frame = &page.frame;
         walk_frame_for_primitives(
             frame,
             Affine2::IDENTITY,
+            ctx,
             line_out,
             text_dbg_out,
             stats,
@@ -289,6 +363,7 @@ fn extract_primitives_into_meshes(
 fn walk_frame_for_primitives(
     frame: &layout::Frame,
     world_from_frame: Affine2,
+    ctx: ExtractCtx,
     line_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
     stats: &mut ExtractStats,
@@ -298,11 +373,18 @@ fn walk_frame_for_primitives(
         match item {
             layout::FrameItem::Group(group) => {
                 stats.groups += 1;
-                let world_from_group =
-                    world_from_frame.mul(affine2_from_typst_transform(group.transform));
+
+                // Compose: parent(frame) * group.transform.
+                let t = affine2_from_typst_transform(group.transform);
+                let world_from_group = world_from_frame.mul(t);
+
+                // Infer "script level" based on group scale.
+                let child_ctx = ctx.with_group_transform(group.transform);
+
                 walk_frame_for_primitives(
                     &group.frame,
                     world_from_group,
+                    child_ctx,
                     line_out,
                     text_dbg_out,
                     stats,
@@ -334,11 +416,18 @@ fn walk_frame_for_primitives(
                     pos.y.to_pt() as f32,
                 ));
 
-                // Try to derive a better debug box from the text item.
-                // If we can't, fall back to a conservative visible placeholder.
-                let (w, h) = derive_text_debug_box_size(text).unwrap_or((6.0f32, 10.0f32));
+                // Derive a baseline-relative debug box and apply script scaling.
+                // If we can't infer anything better, fall back to a visible default.
+                let mut bb = derive_text_debug_box(text);
+                bb.scale *= ctx.script_scale();
 
-                append_axis_aligned_rect_transformed(text_dbg_out, world_from_item, w, h);
+                if ctx.script_level > 0 {
+                    stats.text_script += 1;
+                } else {
+                    stats.text_normal += 1;
+                }
+
+                append_baseline_rect_transformed(text_dbg_out, world_from_item, bb);
                 stats.text_debug_rects += 1;
             }
             _ => {}
@@ -406,24 +495,24 @@ fn append_line_as_rect(mesh: &mut Mesh2D, a: [f32; 2], b: [f32; 2], thickness_pt
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-/// Append an axis-aligned rectangle centered at the item's local origin, transformed by `world_from_item`.
+/// Append a baseline-relative rectangle transformed by `world_from_item`.
 ///
-/// This is used for **debug text boxes**. The rectangle is:
-/// - centered at (0, 0) in item-local space
-/// - width `w_pt`, height `h_pt` in pt
-fn append_axis_aligned_rect_transformed(
-    mesh: &mut Mesh2D,
-    world_from_item: Affine2,
-    w_pt: f32,
-    h_pt: f32,
-) {
-    let hw = 0.5 * w_pt;
-    let hh = 0.5 * h_pt;
+/// Convention:
+/// - In item-local space, the baseline is at y=0.
+/// - We draw the rectangle from:
+///   - x in [-w/2, +w/2]
+///   - y in [-below, +above]
+fn append_baseline_rect_transformed(mesh: &mut Mesh2D, world_from_item: Affine2, bb: BaselineBox) {
+    let w = bb.w_pt * bb.scale;
+    let above = bb.above_baseline_pt * bb.scale;
+    let below = bb.below_baseline_pt * bb.scale;
 
-    let (x0, y0) = world_from_item.transform_point(-hw, -hh);
-    let (x1, y1) = world_from_item.transform_point(hw, -hh);
-    let (x2, y2) = world_from_item.transform_point(hw, hh);
-    let (x3, y3) = world_from_item.transform_point(-hw, hh);
+    let hw = 0.5 * w;
+
+    let (x0, y0) = world_from_item.transform_point(-hw, -below);
+    let (x1, y1) = world_from_item.transform_point(hw, -below);
+    let (x2, y2) = world_from_item.transform_point(hw, above);
+    let (x3, y3) = world_from_item.transform_point(-hw, above);
 
     let base = mesh.positions.len() as u16;
     mesh.positions
@@ -432,85 +521,76 @@ fn append_axis_aligned_rect_transformed(
         .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-/// Best-effort derivation of a debug box size from a Typst `TextItem`.
+/// Baseline-relative debug box for a text item.
 ///
-/// Typst's `TextItem` is intentionally opaque for our Phase A bring-up. We don't have stable,
-/// public access to per-glyph boxes here yet, so we use conservative heuristics.
+/// This uses only stable-ish information we have today:
+/// - `Debug` output of `TextItem` (e.g. `Text("∑")`)
 ///
-/// Goal:
-/// - Make the debug rectangles visually reflect the *relative* visual weight of items
-///   (e.g. "∑" should be larger than "(").
-/// - Avoid relying on unstable internal fields.
-/// - Keep it deterministic and cheap.
-///
-/// This is a stepping stone towards real glyph outline rendering.
-fn derive_text_debug_box_size(text: &TextItem) -> Option<(f32, f32)> {
-    // We observed (via logged Debug output) that `TextItem` formats like:
-    //   Text("𝜁")
-    //   Text("(")
-    //   Text("∑")
-    //
-    // We therefore use `Debug` as a stable-ish extraction mechanism for now.
-    //
-    // NOTE: This is *not* meant to be perfect; it just makes the overlay more informative.
-    let s = format!("{:?}", text);
+/// It intentionally does not try to be exact; it is meant to:
+/// - show relative size differences
+/// - show baseline alignment (above vs below)
+fn derive_text_debug_box(text: &TextItem) -> BaselineBox {
+    // Default: visible small-ish box, baseline-relative.
+    let mut bb = BaselineBox {
+        w_pt: 6.0,
+        above_baseline_pt: 8.0,
+        below_baseline_pt: 2.0,
+        scale: 1.0,
+    };
 
-    // Extract the content inside `Text("...")` if possible.
+    let s = format!("{:?}", text);
     let content = s
         .strip_prefix("Text(\"")
         .and_then(|rest| rest.strip_suffix("\")"));
 
-    let content = match content {
-        Some(c) => c,
-        None => return None,
+    let Some(content) = content else {
+        return bb;
     };
 
-    let mut w = 6.0f32;
-    let mut h = 10.0f32;
-
-    // Base sizing by number of Unicode scalar values (good enough for our symbols).
+    // Base sizing by char count.
     let n = content.chars().count().max(1) as f32;
-    w = 5.0 * n;
-    h = 10.0;
+    bb.w_pt = (5.0 * n).clamp(3.0, 40.0);
+    bb.above_baseline_pt = 8.0;
+    bb.below_baseline_pt = 2.0;
 
-    // Per-symbol tweaks (heuristic).
-    // These are chosen to be visually distinctive for our validation formula.
+    // Per-symbol tweaks for the ζ formula.
     match content {
         "∑" => {
-            w = 16.0;
-            h = 22.0;
+            bb.w_pt = 16.0;
+            bb.above_baseline_pt = 18.0;
+            bb.below_baseline_pt = 4.0;
         }
         "=" => {
-            w = 12.0;
-            h = 6.0;
+            bb.w_pt = 12.0;
+            bb.above_baseline_pt = 4.0;
+            bb.below_baseline_pt = 2.0;
         }
         "(" | ")" => {
-            w = 5.0;
-            h = 14.0;
+            bb.w_pt = 5.0;
+            bb.above_baseline_pt = 12.0;
+            bb.below_baseline_pt = 3.0;
         }
-        // italic math letters (𝑠, etc.) and zeta variant tend to be taller than punctuation.
+        // Greek/math italic letters.
         "𝜁" | "𝑠" | "n" | "s" => {
-            w = 8.0;
-            h = 14.0;
+            bb.w_pt = 8.0;
+            bb.above_baseline_pt = 10.0;
+            bb.below_baseline_pt = 3.0;
         }
-        // Common digits used in subscript/superscript.
+        // Digits.
         "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
-            w = 6.0;
-            h = 10.0;
+            bb.w_pt = 6.0;
+            bb.above_baseline_pt = 8.0;
+            bb.below_baseline_pt = 2.0;
         }
         _ => {
-            // Multi-character tokens (rare in our current formula) get a slightly taller box.
+            // Slightly taller for multi-char.
             if n > 1.0 {
-                h = 12.0;
+                bb.above_baseline_pt = 9.0;
             }
         }
     }
 
-    // Clamp to reasonable bounds so weird glyphs don't explode the view.
-    w = w.clamp(3.0, 40.0);
-    h = h.clamp(4.0, 40.0);
-
-    Some((w, h))
+    bb
 }
 
 /// Convert a Typst `Transform` into our `scene::Affine2`.
