@@ -23,8 +23,17 @@
 //!   - Extract outline from Typst's `Font` (TTF face) using the glyph ID
 //!   - Tessellate outline via lyon into `scene::Mesh2D`
 //!   - Place it using pen position + glyph offsets, then apply `world_from_item`
+//!
+//! Performance note:
+//! - This demo can tessellate many glyph outlines at startup.
+//! - We cache per-glyph tessellations (by glyph ID and sizing parameters) to avoid repeated work.
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Instant,
+};
 
 use anyhow::Context as _;
 use winit::window::Window;
@@ -88,6 +97,9 @@ impl State {
 
         let mut stats = ExtractStats::default();
 
+        // Cache to avoid re-tessellating identical glyph outlines at the same size.
+        let mut glyph_cache = GlyphMeshCache::default();
+
         // Extract once with logging enabled for a small number of Text items.
         // This is intentionally bounded so `timeout ... cargo run --example typst_zeta` remains usable.
         let mut text_debug_logged = 0usize;
@@ -97,6 +109,7 @@ impl State {
             &mut line_mesh,
             &mut text_dbg_mesh,
             &mut glyph_mesh,
+            &mut glyph_cache,
             &mut stats,
             &mut text_debug_logged,
             &mut glyph_bridge_logged,
@@ -105,11 +118,12 @@ impl State {
         // Log extraction stats once at startup so `timeout ... cargo run --example typst_zeta`
         // still gives useful feedback even if the window is killed quickly.
         log::info!(
-            "typst_zeta: extracted lines={} text_dbg_rects={} glyph_tris={} glyph_tess_calls={} groups={} shapes={} texts={} pages={}",
+            "typst_zeta: extracted lines={} text_dbg_rects={} glyph_tris={} glyph_tess_calls={} glyph_calls={} groups={} shapes={} texts={} pages={}",
             stats.lines,
             stats.text_debug_rects,
             stats.glyph_triangles,
             stats.glyph_tess_calls,
+            stats.glyph_calls,
             stats.groups,
             stats.shapes,
             stats.texts,
@@ -292,6 +306,7 @@ struct ExtractStats {
     text_debug_rects: usize,
     glyph_triangles: usize,
     glyph_tess_calls: usize,
+    glyph_calls: usize,
 
     // Debug-only: how many text items we classified as scripts (sub/sup) vs. normal.
     text_script: usize,
@@ -376,6 +391,7 @@ fn extract_primitives_into_meshes(
     line_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
     glyph_dbg_out: &mut Mesh2D,
+    glyph_cache: &mut GlyphMeshCache,
     stats: &mut ExtractStats,
     text_debug_logged: &mut usize,
     glyph_bridge_logged: &mut usize,
@@ -394,6 +410,7 @@ fn extract_primitives_into_meshes(
             line_out,
             text_dbg_out,
             glyph_dbg_out,
+            glyph_cache,
             stats,
             text_debug_logged,
             glyph_bridge_logged,
@@ -408,6 +425,7 @@ fn walk_frame_for_primitives(
     line_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
     glyph_dbg_out: &mut Mesh2D,
+    glyph_cache: &mut GlyphMeshCache,
     stats: &mut ExtractStats,
     text_debug_logged: &mut usize,
     glyph_bridge_logged: &mut usize,
@@ -431,6 +449,7 @@ fn walk_frame_for_primitives(
                     line_out,
                     text_dbg_out,
                     glyph_dbg_out,
+                    glyph_cache,
                     stats,
                     text_debug_logged,
                     glyph_bridge_logged,
@@ -494,7 +513,14 @@ fn walk_frame_for_primitives(
                 // Real glyph outlines: tessellate each glyph outline into triangles.
                 //
                 // This replaces the previous "glyph boxes" placeholder.
-                append_glyph_outlines(glyph_dbg_out, world_from_item, text, bb.scale, stats);
+                append_glyph_outlines(
+                    glyph_dbg_out,
+                    glyph_cache,
+                    world_from_item,
+                    text,
+                    bb.scale,
+                    stats,
+                );
             }
             _ => {}
         }
@@ -534,6 +560,7 @@ fn extract_shape_lines(
 ///   - Place using pen position + glyph offsets
 fn append_glyph_outlines(
     mesh: &mut Mesh2D,
+    cache: &mut GlyphMeshCache,
     world_from_item: Affine2,
     text: &TextItem,
     scale: f32,
@@ -547,104 +574,186 @@ fn append_glyph_outlines(
     if upm <= 0.0 {
         return;
     }
+
     let font_units_to_pt = (text.size.to_pt() as f32) / upm;
+
+    // Convert `scene::Affine2` (column-major 3x3) into tessellator `Affine2x3` once per text item.
+    let world_from_item_2x3 = locus::font::tessellate::Affine2x3 {
+        a: world_from_item.m[0][0],
+        b: world_from_item.m[0][1],
+        c: world_from_item.m[1][0],
+        d: world_from_item.m[1][1],
+        tx: world_from_item.m[2][0],
+        ty: world_from_item.m[2][1],
+    };
+
     let mut pen_x_pt = 0.0f32;
     let pen_y_pt = 0.0f32;
+
     for g in text.glyphs.iter() {
         // Advances/offsets are `Em` relative to font size.
         let adv_pt = g.x_advance.at(text.size).to_pt() as f32;
         let x_off_pt = g.x_offset.at(text.size).to_pt() as f32;
         let y_off_pt = g.y_offset.at(text.size).to_pt() as f32;
-        let gid = ttf_parser::GlyphId(g.id);
-        let mut builder = LyonOutlineBuilder::new();
-        let bbox = face.outline_glyph(gid, &mut builder);
-        if bbox.is_none() {
-            pen_x_pt += adv_pt;
-            continue;
-        }
-        let path = builder.build();
-        // Transform:
-        // 1) scale font units -> pt
-        // 2) apply glyph placement offsets + pen position
-        // 3) apply Typst item's world transform
-        //
-        // We use `locus::font::tessellate::append_tessellated_path` with an affine2x3.
+
+        // Transform parameters for this glyph.
         let sx = font_units_to_pt * scale;
         let sy = font_units_to_pt * scale;
         let tx = (pen_x_pt + x_off_pt) as f32;
         let ty = (pen_y_pt + y_off_pt) as f32;
 
-        // Tessellation transform used by our lyon pipeline.
-        //
-        // We want to apply:
-        //   p_world = world_from_item * local_from_glyph * p_glyph
-        //
-        // Where:
-        // - `p_glyph` is in font units
-        // - `local_from_glyph` scales font units -> pt and translates by (pen + offsets) in pt
-        // - `world_from_item` is the accumulated Typst group transform and item positioning
-        //
-        // Our tessellator takes a 2x3 affine (`Affine2x3`) with:
-        //   [ a c tx ]
-        //   [ b d ty ]
-        //
-        // First build `local_from_glyph`.
-        let local_from_glyph = locus::font::tessellate::Affine2x3 {
-            a: sx,
-            b: 0.0,
-            c: 0.0,
-            d: sy,
-            tx,
-            ty,
+        // Count glyph-level calls separately from tessellation calls.
+        stats.glyph_calls += 1;
+
+        // Cache key: glyph id + transform parameters that affect tessellation result.
+        let key = GlyphCacheKey {
+            glyph_id: g.id,
+            sx_bits: sx.to_bits(),
+            sy_bits: sy.to_bits(),
+            // Translation is NOT part of the cached mesh, we apply it via transform composition below.
+            // We cache a mesh tessellated at origin (tx=0, ty=0) and then translate via composed transform.
+            //
+            // Therefore we cache only scaling (sx/sy) and glyph id.
         };
 
-        // Convert `scene::Affine2` (column-major 3x3) into tessellator `Affine2x3`.
-        let world_from_item_2x3 = locus::font::tessellate::Affine2x3 {
-            a: world_from_item.m[0][0],
-            b: world_from_item.m[0][1],
-            c: world_from_item.m[1][0],
-            d: world_from_item.m[1][1],
-            tx: world_from_item.m[2][0],
-            ty: world_from_item.m[2][1],
-        };
+        // Ensure we have a cached outline path tessellation for this glyph at this scale.
+        // We tessellate in glyph-local space with scale, but without translation.
+        let cached = cache.get_or_insert_with(key, || {
+            let gid = ttf_parser::GlyphId(g.id);
+            let mut builder = LyonOutlineBuilder::new();
+            let bbox = face.outline_glyph(gid, &mut builder);
+            if bbox.is_none() {
+                return None;
+            }
 
-        // Compose: out = world_from_item_2x3 * local_from_glyph
-        let composed = locus::font::tessellate::Affine2x3 {
-            a: world_from_item_2x3.a * local_from_glyph.a
-                + world_from_item_2x3.c * local_from_glyph.b,
-            b: world_from_item_2x3.b * local_from_glyph.a
-                + world_from_item_2x3.d * local_from_glyph.b,
-            c: world_from_item_2x3.a * local_from_glyph.c
-                + world_from_item_2x3.c * local_from_glyph.d,
-            d: world_from_item_2x3.b * local_from_glyph.c
-                + world_from_item_2x3.d * local_from_glyph.d,
-            tx: world_from_item_2x3.a * local_from_glyph.tx
-                + world_from_item_2x3.c * local_from_glyph.ty
-                + world_from_item_2x3.tx,
-            ty: world_from_item_2x3.b * local_from_glyph.tx
-                + world_from_item_2x3.d * local_from_glyph.ty
-                + world_from_item_2x3.ty,
-        };
+            let path = builder.build();
 
-        // Track triangle count precisely by measuring mesh index growth for this glyph.
-        let before_indices = mesh.indices.len();
+            let local_no_translate = locus::font::tessellate::Affine2x3 {
+                a: sx,
+                b: 0.0,
+                c: 0.0,
+                d: sy,
+                tx: 0.0,
+                ty: 0.0,
+            };
 
-        let _ = locus::font::tessellate::append_tessellated_path(
-            mesh,
-            &path,
-            composed,
-            locus::font::tessellate::TessellateOptions::default(),
-        );
+            let mut tmp = Mesh2D::default();
+            if locus::font::tessellate::append_tessellated_path(
+                &mut tmp,
+                &path,
+                local_no_translate,
+                locus::font::tessellate::TessellateOptions::default(),
+            )
+            .is_err()
+            {
+                return None;
+            }
 
-        let after_indices = mesh.indices.len();
-        let added_indices = after_indices.saturating_sub(before_indices);
+            Some(tmp)
+        });
 
-        // Each triangle is 3 indices.
-        stats.glyph_triangles += added_indices / 3;
-        stats.glyph_tess_calls += 1;
+        if let Some(src) = cached {
+            // Compose: out = world_from_item_2x3 * translate(tx, ty)
+            let t_only = locus::font::tessellate::Affine2x3 {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                tx,
+                ty,
+            };
+
+            let composed = mul_affine2x3(world_from_item_2x3, t_only);
+
+            // Append cached mesh with transformed positions (no re-tessellation).
+            let before_indices = mesh.indices.len();
+            append_mesh_with_transform(mesh, src, composed);
+            let after_indices = mesh.indices.len();
+            let added_indices = after_indices.saturating_sub(before_indices);
+
+            stats.glyph_triangles += added_indices / 3;
+            stats.glyph_tess_calls += 1;
+        }
 
         pen_x_pt += adv_pt;
     }
+}
+
+/// Glyph mesh cache key.
+///
+/// We cache tessellated meshes in glyph-local space (scaled to pt), but without translation.
+/// Translation is applied when appending to the final mesh.
+///
+/// NOTE:
+/// - We hash scale factors by their bit pattern to avoid float hashing pitfalls.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct GlyphCacheKey {
+    glyph_id: u16,
+    sx_bits: u32,
+    sy_bits: u32,
+}
+impl Hash for GlyphCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.glyph_id.hash(state);
+        self.sx_bits.hash(state);
+        self.sy_bits.hash(state);
+    }
+}
+
+/// Cache for tessellated glyph meshes.
+#[derive(Debug, Default)]
+struct GlyphMeshCache {
+    inner: HashMap<GlyphCacheKey, Option<Mesh2D>>,
+}
+impl GlyphMeshCache {
+    fn get_or_insert_with(
+        &mut self,
+        key: GlyphCacheKey,
+        f: impl FnOnce() -> Option<Mesh2D>,
+    ) -> Option<&Mesh2D> {
+        let entry = self.inner.entry(key).or_insert_with(f);
+        entry.as_ref()
+    }
+}
+
+/// Multiply two `Affine2x3` transforms: out = a * b.
+fn mul_affine2x3(
+    a: locus::font::tessellate::Affine2x3,
+    b: locus::font::tessellate::Affine2x3,
+) -> locus::font::tessellate::Affine2x3 {
+    locus::font::tessellate::Affine2x3 {
+        a: a.a * b.a + a.c * b.b,
+        b: a.b * b.a + a.d * b.b,
+        c: a.a * b.c + a.c * b.d,
+        d: a.b * b.c + a.d * b.d,
+        tx: a.a * b.tx + a.c * b.ty + a.tx,
+        ty: a.b * b.tx + a.d * b.ty + a.ty,
+    }
+}
+
+/// Append `src` into `dst` after transforming src positions by `xf`.
+///
+/// This avoids re-tessellating cached glyph meshes; it just transforms vertices and appends indices.
+fn append_mesh_with_transform(
+    dst: &mut Mesh2D,
+    src: &Mesh2D,
+    xf: locus::font::tessellate::Affine2x3,
+) {
+    let base = dst.positions.len();
+    // Keep u16 indices safety consistent with existing helpers.
+    assert!(
+        base + src.positions.len() <= u16::MAX as usize,
+        "append_mesh_with_transform: vertex count overflow for u16 indices"
+    );
+
+    dst.positions.extend(src.positions.iter().map(|p| {
+        let (x, y) = xf.transform_point(p[0], p[1]);
+        [x, y]
+    }));
+
+    let base_u16 = base as u16;
+    dst.indices
+        .extend(src.indices.iter().copied().map(|i| base_u16 + i));
 }
 
 /// Convert `ttf-parser` outline callbacks into a `lyon::path::Path`.
