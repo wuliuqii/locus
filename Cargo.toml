@@ -30,7 +30,13 @@ typst-assets = { version = "0.14", features = ["fonts"] }
 
 # Font discovery & parsing (vector outlines)
 fontdb = "0.21"
-ttf-parser = "0.20"
+
+# IMPORTANT:
+# Typst 0.14 pulls in a newer `ttf-parser` than our previous direct dependency.
+# We align our direct dependency to Typst's version to avoid trait/type mismatches
+# (e.g. `ttf_parser::OutlineBuilder`, `ttf_parser::GlyphId`) when mixing Typst font faces
+# with our own outline extraction code.
+ttf-parser = "0.25.1"
 
 # Optional helpers you'll likely want soon:
 # - once_cell: global fontdb cache

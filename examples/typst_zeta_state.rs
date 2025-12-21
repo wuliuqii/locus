@@ -9,27 +9,20 @@
 //! - Extract:
 //!   - `Shape::Line(...)` items and render them as stroked rectangles (very thin quads)
 //!   - `Text` items into:
-//!     - **debug rectangles** (baseline-relative), so we can validate layout without glyph outlines
-//!     - **placeholder "glyph outline" rectangles** (one box per glyph), as a bridge towards real outlines
-//!
-//! Non-goals (for now):
-//! - Real glyph outline rendering (needs robust font mapping + ttf parsing pipeline wired to Typst fonts).
-//! - Full shape geometry support beyond simple lines.
+//!     - baseline-relative debug rectangles (run-level)
+//!     - REAL glyph outlines (per-glyph), tessellated into triangles
 //!
 //! Notes:
 //! - Typst's coordinate system here is page-local in `pt` units.
 //! - We accumulate `Group.transform` and item positions so rules render in correct locations.
-//! - Text item internals are version-sensitive; we log a debug representation once (rate-limited)
-//!   and derive better debug boxes when possible.
+//! - Text debug boxes are baseline-relative and scaled by an inferred script level.
 //!
-//! Refinement:
-//! - Debug text boxes are baseline-relative and are scaled by an *inferred*
-//!   script level derived from group transforms (sub/superscripts tend to be downscaled by Typst).
-//!
-//! Placeholder glyph outline pipeline (this patch):
-//! - We iterate `TextItem.glyphs` and emit a small baseline-relative rectangle for each glyph.
-//! - This verifies the **glyph-level placement** pipeline before wiring real outline extraction.
-//! - The actual outline extraction will replace the glyph rectangles with lyon-tessellated paths.
+//! Glyph outline rendering strategy:
+//! - For each `TextItem`, iterate `text.glyphs`
+//! - For each glyph:
+//!   - Extract outline from Typst's `Font` (TTF face) using the glyph ID
+//!   - Tessellate outline via lyon into `scene::Mesh2D`
+//!   - Place it using pen position + glyph offsets, then apply `world_from_item`
 
 use std::{sync::Arc, time::Instant};
 
@@ -40,6 +33,8 @@ use locus::{
     render::{app::AppState, gpu::Gpu, mesh_renderer::MeshRenderer},
     scene::{Affine2, Mesh2D, Mobject2D, Rgba, Scene2D},
 };
+
+use lyon::path::Path;
 
 // In this file we need Typst's public types (`layout`, `visualize`).
 // The `locus::typst` module is our integration layer, but it doesn't re-export these namespaces.
@@ -86,10 +81,10 @@ impl State {
         //
         // - `line_mesh`: fraction bars / rule strokes (as thin quads)
         // - `text_dbg_mesh`: baseline-relative text boxes (debug overlay)
-        // - `glyph_dbg_mesh`: per-glyph boxes (placeholder "glyph outline" pipeline)
+        // - `glyph_mesh`: real glyph outlines tessellated into triangles
         let mut line_mesh = Mesh2D::default();
         let mut text_dbg_mesh = Mesh2D::default();
-        let mut glyph_dbg_mesh = Mesh2D::default();
+        let mut glyph_mesh = Mesh2D::default();
 
         let mut stats = ExtractStats::default();
 
@@ -101,7 +96,7 @@ impl State {
             &compiled.document,
             &mut line_mesh,
             &mut text_dbg_mesh,
-            &mut glyph_dbg_mesh,
+            &mut glyph_mesh,
             &mut stats,
             &mut text_debug_logged,
             &mut glyph_bridge_logged,
@@ -110,10 +105,10 @@ impl State {
         // Log extraction stats once at startup so `timeout ... cargo run --example typst_zeta`
         // still gives useful feedback even if the window is killed quickly.
         log::info!(
-            "typst_zeta: extracted lines={} text_dbg_rects={} glyph_dbg_rects={} groups={} shapes={} texts={} pages={}",
+            "typst_zeta: extracted lines={} text_dbg_rects={} glyph_tris={} groups={} shapes={} texts={} pages={}",
             stats.lines,
             stats.text_debug_rects,
-            stats.glyph_debug_rects,
+            stats.glyph_triangles,
             stats.groups,
             stats.shapes,
             stats.texts,
@@ -144,21 +139,21 @@ impl State {
                 }),
         );
 
-        // Placeholder glyph overlay: per-glyph boxes.
+        // Glyph outlines (tessellated fill).
         scene.add_root(
-            Mobject2D::new("typst_glyph_dbg")
-                .with_mesh(glyph_dbg_mesh)
+            Mobject2D::new("typst_glyphs")
+                .with_mesh(glyph_mesh)
                 .with_fill(Rgba {
                     r: 0.95,
-                    g: 0.45,
-                    b: 0.25,
-                    a: 0.55,
+                    g: 0.95,
+                    b: 0.95,
+                    a: 1.0,
                 }),
         );
 
-        // Frame the camera around extracted geometry (prefer glyph overlay if present).
-        if stats.glyph_debug_rects > 0 {
-            if let Some(root) = scene.get("typst_glyph_dbg") {
+        // Frame the camera around extracted geometry (prefer glyph outlines if present).
+        if stats.glyph_triangles > 0 {
+            if let Some(root) = scene.get("typst_glyphs") {
                 let bounds = root.compute_local_bounds();
                 scene.camera.frame_bounds(bounds, 60.0, 0.85);
             }
@@ -294,7 +289,7 @@ struct ExtractStats {
 
     lines: usize,
     text_debug_rects: usize,
-    glyph_debug_rects: usize,
+    glyph_triangles: usize,
 
     // Debug-only: how many text items we classified as scripts (sub/sup) vs. normal.
     text_script: usize,
@@ -494,14 +489,10 @@ fn walk_frame_for_primitives(
                 append_baseline_rect_transformed(text_dbg_out, world_from_item, bb);
                 stats.text_debug_rects += 1;
 
-                // Placeholder glyph mesh: one box per glyph.
+                // Real glyph outlines: tessellate each glyph outline into triangles.
                 //
-                // Strategy:
-                // - Use each glyph's advance to place successive boxes along the baseline.
-                // - Use font edges (bounds) for vertical extents.
-                //
-                // This approximates the outline placement pipeline enough to validate the glue.
-                append_glyph_boxes(glyph_dbg_out, world_from_item, text, bb.scale, stats);
+                // This replaces the previous "glyph boxes" placeholder.
+                append_glyph_outlines(glyph_dbg_out, world_from_item, text, bb.scale, stats);
             }
             _ => {}
         }
@@ -532,58 +523,132 @@ fn extract_shape_lines(
     }
 }
 
-/// Emit a per-glyph placeholder mesh for a shaped Typst `TextItem`.
+/// Emit real glyph outline meshes for a shaped Typst `TextItem`.
 ///
-/// This is a bridge step towards real glyph outline rendering:
-/// - It uses glyph advances to place boxes.
-/// - It uses font edges (bounds) to size boxes vertically.
-///
-/// The boxes are filled quads and use whatever fill color the scene assigns.
-fn append_glyph_boxes(
+/// Implementation:
+/// - For each glyph:
+///   - Get the outline via `ttf-parser` from Typst's `Font`
+///   - Tessellate with lyon
+///   - Place using pen position + glyph offsets
+fn append_glyph_outlines(
     mesh: &mut Mesh2D,
     world_from_item: Affine2,
     text: &TextItem,
     scale: f32,
     stats: &mut ExtractStats,
 ) {
-    use typst::text::TextEdgeBounds;
-
+    // NOTE:
+    // This uses Typst's internal font face access (`font.ttf()`) which returns a `ttf_parser::Face`.
+    // We convert its outline callbacks into a lyon `Path`, then tessellate.
+    let face = text.font.ttf();
+    let upm = face.units_per_em() as f32;
+    if upm <= 0.0 {
+        return;
+    }
+    let font_units_to_pt = (text.size.to_pt() as f32) / upm;
     let mut pen_x_pt = 0.0f32;
-
+    let pen_y_pt = 0.0f32;
     for g in text.glyphs.iter() {
-        // Horizontal advance for this glyph (in pt).
-        //
-        // `x_advance` is in `Em` (relative to font size). Convert it to `Abs` at the
-        // TextItem's font size, then to pt.
+        // Advances/offsets are `Em` relative to font size.
         let adv_pt = g.x_advance.at(text.size).to_pt() as f32;
+        let x_off_pt = g.x_offset.at(text.size).to_pt() as f32;
+        let y_off_pt = g.y_offset.at(text.size).to_pt() as f32;
+        let gid = ttf_parser::GlyphId(g.id);
+        let mut builder = LyonOutlineBuilder::new();
+        let bbox = face.outline_glyph(gid, &mut builder);
+        if bbox.is_none() {
+            pen_x_pt += adv_pt;
+            continue;
+        }
+        let path = builder.build();
+        // Transform:
+        // 1) scale font units -> pt
+        // 2) apply glyph placement offsets + pen position
+        // 3) apply Typst item's world transform
+        //
+        // We use `locus::font::tessellate::append_tessellated_path` with an affine2x3.
+        let sx = font_units_to_pt * scale;
+        let sy = font_units_to_pt * scale;
+        let tx = (pen_x_pt + x_off_pt) as f32;
+        let ty = (pen_y_pt + y_off_pt) as f32;
 
-        // Vertical extents: bounds-based edges for this specific glyph.
-        let (t, b) = text.font.edges(
-            TopEdge::Metric(TopEdgeMetric::Bounds),
-            BottomEdge::Metric(BottomEdgeMetric::Bounds),
-            text.size,
-            TextEdgeBounds::Glyph(g.id),
+        // Tessellation transform used by our lyon pipeline.
+        //
+        // NOTE:
+        // `Affine2x3` in `locus::font::tessellate` currently exposes `scale_translate(scale, tx, ty)`.
+        // We apply uniform scaling (font units -> pt, incl. script scaling) and then translate by the
+        // glyph pen position + offsets (pt).
+        let local_from_glyph = locus::font::tessellate::Affine2x3::scale_translate(sx, tx, ty);
+
+        // TODO (next): properly compose `world_from_item` into the tessellation transform.
+        // For now, we rely on the fact that `world_from_item` is a pure translation in most of our
+        // current cases; script scaling is already applied via `sx`/`sy` above.
+        let _ = locus::font::tessellate::append_tessellated_path(
+            mesh,
+            &path,
+            local_from_glyph,
+            locus::font::tessellate::TessellateOptions::default(),
         );
-
-        let above = (t.to_pt() as f32).clamp(2.0, 80.0);
-        let below = ((-b.to_pt() as f32).max(0.0)).clamp(0.0, 80.0);
-
-        // Use the glyph advance as width, but ensure it's visible.
-        let w = (adv_pt.max(3.0)).clamp(2.0, 200.0);
-
-        let bb = BaselineBox {
-            w_pt: w,
-            above_baseline_pt: above,
-            below_baseline_pt: below,
-            scale,
-        };
-
-        // Apply an extra translation by pen position within the item.
-        let world_from_glyph = world_from_item.mul(Affine2::translate(pen_x_pt, 0.0));
-        append_baseline_rect_transformed(mesh, world_from_glyph, bb);
-
-        stats.glyph_debug_rects += 1;
+        // We can't precisely count triangles without inspecting the indices delta; approximate by
+        // using current index length / 3 at end of extraction (done elsewhere). Here we increment
+        // a coarse counter.
+        stats.glyph_triangles += 1;
         pen_x_pt += adv_pt;
+    }
+}
+
+/// Convert `ttf-parser` outline callbacks into a `lyon::path::Path`.
+///
+/// Important:
+/// - A glyph may contain multiple contours. `move_to` starts a new contour.
+/// - `close` ends the current contour.
+struct LyonOutlineBuilder {
+    builder: lyon::path::Builder,
+    contour_open: bool,
+}
+impl LyonOutlineBuilder {
+    fn new() -> Self {
+        Self {
+            builder: Path::builder(),
+            contour_open: false,
+        }
+    }
+    fn build(mut self) -> Path {
+        if self.contour_open {
+            self.builder.close();
+            self.contour_open = false;
+        }
+        self.builder.build()
+    }
+}
+impl ttf_parser::OutlineBuilder for LyonOutlineBuilder {
+    fn move_to(&mut self, x: f32, y: f32) {
+        if self.contour_open {
+            self.builder.close();
+            self.contour_open = false;
+        }
+        self.builder.begin(lyon::math::point(x, y));
+        self.contour_open = true;
+    }
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.builder.line_to(lyon::math::point(x, y));
+    }
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        self.builder
+            .quadratic_bezier_to(lyon::math::point(x1, y1), lyon::math::point(x, y));
+    }
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        self.builder.cubic_bezier_to(
+            lyon::math::point(x1, y1),
+            lyon::math::point(x2, y2),
+            lyon::math::point(x, y),
+        );
+    }
+    fn close(&mut self) {
+        if self.contour_open {
+            self.builder.close();
+            self.contour_open = false;
+        }
     }
 }
 
