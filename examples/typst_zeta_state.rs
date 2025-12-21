@@ -574,19 +574,60 @@ fn append_glyph_outlines(
 
         // Tessellation transform used by our lyon pipeline.
         //
-        // NOTE:
-        // `Affine2x3` in `locus::font::tessellate` currently exposes `scale_translate(scale, tx, ty)`.
-        // We apply uniform scaling (font units -> pt, incl. script scaling) and then translate by the
-        // glyph pen position + offsets (pt).
-        let local_from_glyph = locus::font::tessellate::Affine2x3::scale_translate(sx, tx, ty);
+        // We want to apply:
+        //   p_world = world_from_item * local_from_glyph * p_glyph
+        //
+        // Where:
+        // - `p_glyph` is in font units
+        // - `local_from_glyph` scales font units -> pt and translates by (pen + offsets) in pt
+        // - `world_from_item` is the accumulated Typst group transform and item positioning
+        //
+        // Our tessellator takes a 2x3 affine (`Affine2x3`) with:
+        //   [ a c tx ]
+        //   [ b d ty ]
+        //
+        // First build `local_from_glyph`.
+        let local_from_glyph = locus::font::tessellate::Affine2x3 {
+            a: sx,
+            b: 0.0,
+            c: 0.0,
+            d: sy,
+            tx,
+            ty,
+        };
 
-        // TODO (next): properly compose `world_from_item` into the tessellation transform.
-        // For now, we rely on the fact that `world_from_item` is a pure translation in most of our
-        // current cases; script scaling is already applied via `sx`/`sy` above.
+        // Convert `scene::Affine2` (column-major 3x3) into tessellator `Affine2x3`.
+        let world_from_item_2x3 = locus::font::tessellate::Affine2x3 {
+            a: world_from_item.m[0][0],
+            b: world_from_item.m[0][1],
+            c: world_from_item.m[1][0],
+            d: world_from_item.m[1][1],
+            tx: world_from_item.m[2][0],
+            ty: world_from_item.m[2][1],
+        };
+
+        // Compose: out = world_from_item_2x3 * local_from_glyph
+        let composed = locus::font::tessellate::Affine2x3 {
+            a: world_from_item_2x3.a * local_from_glyph.a
+                + world_from_item_2x3.c * local_from_glyph.b,
+            b: world_from_item_2x3.b * local_from_glyph.a
+                + world_from_item_2x3.d * local_from_glyph.b,
+            c: world_from_item_2x3.a * local_from_glyph.c
+                + world_from_item_2x3.c * local_from_glyph.d,
+            d: world_from_item_2x3.b * local_from_glyph.c
+                + world_from_item_2x3.d * local_from_glyph.d,
+            tx: world_from_item_2x3.a * local_from_glyph.tx
+                + world_from_item_2x3.c * local_from_glyph.ty
+                + world_from_item_2x3.tx,
+            ty: world_from_item_2x3.b * local_from_glyph.tx
+                + world_from_item_2x3.d * local_from_glyph.ty
+                + world_from_item_2x3.ty,
+        };
+
         let _ = locus::font::tessellate::append_tessellated_path(
             mesh,
             &path,
-            local_from_glyph,
+            composed,
             locus::font::tessellate::TessellateOptions::default(),
         );
         // We can't precisely count triangles without inspecting the indices delta; approximate by
