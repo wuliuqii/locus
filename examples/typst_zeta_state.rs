@@ -8,10 +8,12 @@
 //! - Traverse the resulting `PagedDocument` frames.
 //! - Extract:
 //!   - `Shape::Line(...)` items and render them as stroked rectangles (very thin quads)
-//!   - `Text` items as **debug rectangles** (approximate), so we can validate layout without glyph outlines
+//!   - `Text` items into:
+//!     - **debug rectangles** (baseline-relative), so we can validate layout without glyph outlines
+//!     - **placeholder "glyph outline" rectangles** (one box per glyph), as a bridge towards real outlines
 //!
 //! Non-goals (for now):
-//! - Glyph outline rendering (next phase).
+//! - Real glyph outline rendering (needs robust font mapping + ttf parsing pipeline wired to Typst fonts).
 //! - Full shape geometry support beyond simple lines.
 //!
 //! Notes:
@@ -21,8 +23,13 @@
 //!   and derive better debug boxes when possible.
 //!
 //! Refinement:
-//! - Debug text boxes are now baseline-relative (not centered), and are scaled by an *inferred*
+//! - Debug text boxes are baseline-relative and are scaled by an *inferred*
 //!   script level derived from group transforms (sub/superscripts tend to be downscaled by Typst).
+//!
+//! Placeholder glyph outline pipeline (this patch):
+//! - We iterate `TextItem.glyphs` and emit a small baseline-relative rectangle for each glyph.
+//! - This verifies the **glyph-level placement** pipeline before wiring real outline extraction.
+//! - The actual outline extraction will replace the glyph rectangles with lyon-tessellated paths.
 
 use std::{sync::Arc, time::Instant};
 
@@ -37,6 +44,10 @@ use locus::{
 // In this file we need Typst's public types (`layout`, `visualize`).
 // The `locus::typst` module is our integration layer, but it doesn't re-export these namespaces.
 use typst::{layout, text::TextItem, visualize};
+
+// `Abs` is Typst's absolute length type; we convert it to pt for debug visualization.
+use typst::layout::Abs;
+use typst::text::{BottomEdge, BottomEdgeMetric, TopEdge, TopEdgeMetric};
 
 /// Demo state for "Typst ζ → extract primitives → render".
 pub struct State {
@@ -53,6 +64,9 @@ pub struct State {
     // Debug: log the first few Text items once so we can learn the public surface of typst 0.14's
     // `layout::TextItem` on this build and decide what we can use for better debug boxes.
     text_debug_logged: usize,
+
+    // Debug: log the first few "glyph bridge" details.
+    glyph_bridge_logged: usize,
 }
 
 impl State {
@@ -71,29 +85,35 @@ impl State {
         // Extract primitives from the compiled document.
         //
         // - `line_mesh`: fraction bars / rule strokes (as thin quads)
-        // - `text_dbg_mesh`: approximate text rectangles (debug overlay)
+        // - `text_dbg_mesh`: baseline-relative text boxes (debug overlay)
+        // - `glyph_dbg_mesh`: per-glyph boxes (placeholder "glyph outline" pipeline)
         let mut line_mesh = Mesh2D::default();
         let mut text_dbg_mesh = Mesh2D::default();
+        let mut glyph_dbg_mesh = Mesh2D::default();
 
         let mut stats = ExtractStats::default();
 
         // Extract once with logging enabled for a small number of Text items.
         // This is intentionally bounded so `timeout ... cargo run --example typst_zeta` remains usable.
         let mut text_debug_logged = 0usize;
+        let mut glyph_bridge_logged = 0usize;
         extract_primitives_into_meshes(
             &compiled.document,
             &mut line_mesh,
             &mut text_dbg_mesh,
+            &mut glyph_dbg_mesh,
             &mut stats,
             &mut text_debug_logged,
+            &mut glyph_bridge_logged,
         );
 
         // Log extraction stats once at startup so `timeout ... cargo run --example typst_zeta`
         // still gives useful feedback even if the window is killed quickly.
         log::info!(
-            "typst_zeta: extracted lines={} text_dbg_rects={} groups={} shapes={} texts={} pages={}",
+            "typst_zeta: extracted lines={} text_dbg_rects={} glyph_dbg_rects={} groups={} shapes={} texts={} pages={}",
             stats.lines,
             stats.text_debug_rects,
+            stats.glyph_debug_rects,
             stats.groups,
             stats.shapes,
             stats.texts,
@@ -112,7 +132,7 @@ impl State {
                 }),
         );
 
-        // Debug overlay: approximate text boxes.
+        // Debug overlay: baseline-relative text boxes.
         scene.add_root(
             Mobject2D::new("typst_text_dbg")
                 .with_mesh(text_dbg_mesh)
@@ -120,14 +140,29 @@ impl State {
                     r: 0.30,
                     g: 0.85,
                     b: 0.95,
+                    a: 0.40,
+                }),
+        );
+
+        // Placeholder glyph overlay: per-glyph boxes.
+        scene.add_root(
+            Mobject2D::new("typst_glyph_dbg")
+                .with_mesh(glyph_dbg_mesh)
+                .with_fill(Rgba {
+                    r: 0.95,
+                    g: 0.45,
+                    b: 0.25,
                     a: 0.55,
                 }),
         );
 
-        // Frame the camera around extracted geometry (prefer text overlay if present).
-        //
-        // This avoids framing around a single thin rule which can feel "too zoomed in".
-        if stats.text_debug_rects > 0 {
+        // Frame the camera around extracted geometry (prefer glyph overlay if present).
+        if stats.glyph_debug_rects > 0 {
+            if let Some(root) = scene.get("typst_glyph_dbg") {
+                let bounds = root.compute_local_bounds();
+                scene.camera.frame_bounds(bounds, 60.0, 0.85);
+            }
+        } else if stats.text_debug_rects > 0 {
             if let Some(root) = scene.get("typst_text_dbg") {
                 let bounds = root.compute_local_bounds();
                 scene.camera.frame_bounds(bounds, 60.0, 0.85);
@@ -151,6 +186,7 @@ impl State {
             start_time: Instant::now(),
             base_zoom,
             text_debug_logged,
+            glyph_bridge_logged,
         })
     }
 
@@ -258,10 +294,14 @@ struct ExtractStats {
 
     lines: usize,
     text_debug_rects: usize,
+    glyph_debug_rects: usize,
 
     // Debug-only: how many text items we classified as scripts (sub/sup) vs. normal.
     text_script: usize,
     text_normal: usize,
+
+    // Debug-only: how many text items we attempted to bridge into glyph data.
+    glyph_bridge_attempts: usize,
 }
 
 /// Extraction context carried through recursion.
@@ -338,8 +378,10 @@ fn extract_primitives_into_meshes(
     doc: &layout::PagedDocument,
     line_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
+    glyph_dbg_out: &mut Mesh2D,
     stats: &mut ExtractStats,
     text_debug_logged: &mut usize,
+    glyph_bridge_logged: &mut usize,
 ) {
     stats.pages = doc.pages.len();
 
@@ -354,8 +396,10 @@ fn extract_primitives_into_meshes(
             ctx,
             line_out,
             text_dbg_out,
+            glyph_dbg_out,
             stats,
             text_debug_logged,
+            glyph_bridge_logged,
         );
     }
 }
@@ -366,8 +410,10 @@ fn walk_frame_for_primitives(
     ctx: ExtractCtx,
     line_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
+    glyph_dbg_out: &mut Mesh2D,
     stats: &mut ExtractStats,
     text_debug_logged: &mut usize,
+    glyph_bridge_logged: &mut usize,
 ) {
     for (pos, item) in frame.items() {
         match item {
@@ -387,8 +433,10 @@ fn walk_frame_for_primitives(
                     child_ctx,
                     line_out,
                     text_dbg_out,
+                    glyph_dbg_out,
                     stats,
                     text_debug_logged,
+                    glyph_bridge_logged,
                 );
             }
             layout::FrameItem::Shape(shape, _span) => {
@@ -400,10 +448,12 @@ fn walk_frame_for_primitives(
                 extract_shape_lines(world_from_item, shape, line_out, stats);
             }
             layout::FrameItem::Text(text) => {
-                // For Phase A layout debugging, we draw a debug rectangle for each text item.
-                // Additionally, we log the debug representation of the first few text items
-                // (rate-limited) so we can discover which public fields are available in typst 0.14
-                // and improve these boxes.
+                // For Phase A layout debugging, we draw:
+                // - one baseline-relative debug rectangle per TextItem (run-level)
+                // - one baseline-relative debug rectangle per glyph (glyph-level placeholder)
+                //
+                // This gets us very close to the eventual outline pipeline, but without requiring
+                // font mapping yet.
                 stats.texts += 1;
 
                 if *text_debug_logged < 6 {
@@ -411,13 +461,27 @@ fn walk_frame_for_primitives(
                     *text_debug_logged += 1;
                 }
 
+                // --- Glyph bridge (Phase A bring-up) ---
+                // We log glyph counts and some basic font sizing information to prepare for
+                // outline rendering.
+                stats.glyph_bridge_attempts += 1;
+                if *glyph_bridge_logged < 6 {
+                    let glyph_count = text.glyphs.len();
+                    log::info!(
+                        "typst_zeta: glyph bridge: script_level={} glyphs={} size={:?}",
+                        ctx.script_level,
+                        glyph_count,
+                        text.size
+                    );
+                    *glyph_bridge_logged += 1;
+                }
+
                 let world_from_item = world_from_frame.mul(Affine2::translate(
                     pos.x.to_pt() as f32,
                     pos.y.to_pt() as f32,
                 ));
 
-                // Derive a baseline-relative debug box and apply script scaling.
-                // If we can't infer anything better, fall back to a visible default.
+                // Derive a baseline-relative debug box from real metrics, then apply script scaling.
                 let mut bb = derive_text_debug_box(text);
                 bb.scale *= ctx.script_scale();
 
@@ -429,6 +493,15 @@ fn walk_frame_for_primitives(
 
                 append_baseline_rect_transformed(text_dbg_out, world_from_item, bb);
                 stats.text_debug_rects += 1;
+
+                // Placeholder glyph mesh: one box per glyph.
+                //
+                // Strategy:
+                // - Use each glyph's advance to place successive boxes along the baseline.
+                // - Use font edges (bounds) for vertical extents.
+                //
+                // This approximates the outline placement pipeline enough to validate the glue.
+                append_glyph_boxes(glyph_dbg_out, world_from_item, text, bb.scale, stats);
             }
             _ => {}
         }
@@ -456,6 +529,61 @@ fn extract_shape_lines(
 
         append_line_as_rect(out, [x0, y0], [x1, y1], thickness_pt);
         stats.lines += 1;
+    }
+}
+
+/// Emit a per-glyph placeholder mesh for a shaped Typst `TextItem`.
+///
+/// This is a bridge step towards real glyph outline rendering:
+/// - It uses glyph advances to place boxes.
+/// - It uses font edges (bounds) to size boxes vertically.
+///
+/// The boxes are filled quads and use whatever fill color the scene assigns.
+fn append_glyph_boxes(
+    mesh: &mut Mesh2D,
+    world_from_item: Affine2,
+    text: &TextItem,
+    scale: f32,
+    stats: &mut ExtractStats,
+) {
+    use typst::text::TextEdgeBounds;
+
+    let mut pen_x_pt = 0.0f32;
+
+    for g in text.glyphs.iter() {
+        // Horizontal advance for this glyph (in pt).
+        //
+        // `x_advance` is in `Em` (relative to font size). Convert it to `Abs` at the
+        // TextItem's font size, then to pt.
+        let adv_pt = g.x_advance.at(text.size).to_pt() as f32;
+
+        // Vertical extents: bounds-based edges for this specific glyph.
+        let (t, b) = text.font.edges(
+            TopEdge::Metric(TopEdgeMetric::Bounds),
+            BottomEdge::Metric(BottomEdgeMetric::Bounds),
+            text.size,
+            TextEdgeBounds::Glyph(g.id),
+        );
+
+        let above = (t.to_pt() as f32).clamp(2.0, 80.0);
+        let below = ((-b.to_pt() as f32).max(0.0)).clamp(0.0, 80.0);
+
+        // Use the glyph advance as width, but ensure it's visible.
+        let w = (adv_pt.max(3.0)).clamp(2.0, 200.0);
+
+        let bb = BaselineBox {
+            w_pt: w,
+            above_baseline_pt: above,
+            below_baseline_pt: below,
+            scale,
+        };
+
+        // Apply an extra translation by pen position within the item.
+        let world_from_glyph = world_from_item.mul(Affine2::translate(pen_x_pt, 0.0));
+        append_baseline_rect_transformed(mesh, world_from_glyph, bb);
+
+        stats.glyph_debug_rects += 1;
+        pen_x_pt += adv_pt;
     }
 }
 
@@ -530,67 +658,80 @@ fn append_baseline_rect_transformed(mesh: &mut Mesh2D, world_from_item: Affine2,
 /// - show relative size differences
 /// - show baseline alignment (above vs below)
 fn derive_text_debug_box(text: &TextItem) -> BaselineBox {
-    // Default: visible small-ish box, baseline-relative.
-    let mut bb = BaselineBox {
-        w_pt: 6.0,
-        above_baseline_pt: 8.0,
-        below_baseline_pt: 2.0,
-        scale: 1.0,
-    };
+    // Prefer real Typst metrics when available.
+    //
+    // TextItem fields in typst 0.14 (as constructed by typst-layout) include:
+    // - font, size, text, glyphs
+    // and methods like:
+    // - width(): Abs
+    //
+    // We use:
+    // - width as `w_pt`
+    // - a conservative edge estimate from the font at this size:
+    //   - top/bottom edges based on the first glyph (or zero bounds)
+    //
+    // If anything is missing or yields degenerate sizes, we fall back to heuristics.
+    let width_abs: Abs = text.width();
+    let mut w_pt = width_abs.to_pt() as f32;
 
-    let s = format!("{:?}", text);
-    let content = s
-        .strip_prefix("Text(\"")
-        .and_then(|rest| rest.strip_suffix("\")"));
+    // Conservative defaults for vertical metrics when we can't infer edges.
+    let mut above = 8.0f32;
+    let mut below = 2.0f32;
 
-    let Some(content) = content else {
-        return bb;
-    };
+    // Try to infer better vertical bounds using the font's edge metrics.
+    // We use TextEdgeBounds::Zero as a safe fallback. If glyphs exist, we try the first glyph id.
+    //
+    // NOTE: We intentionally keep this robust and avoid deep coupling to private APIs.
+    {
+        use typst::text::TextEdgeBounds;
 
-    // Base sizing by char count.
-    let n = content.chars().count().max(1) as f32;
-    bb.w_pt = (5.0 * n).clamp(3.0, 40.0);
-    bb.above_baseline_pt = 8.0;
-    bb.below_baseline_pt = 2.0;
+        let bounds = if let Some(g) = text.glyphs.first() {
+            TextEdgeBounds::Glyph(g.id)
+        } else {
+            TextEdgeBounds::Zero
+        };
 
-    // Per-symbol tweaks for the ζ formula.
-    match content {
-        "∑" => {
-            bb.w_pt = 16.0;
-            bb.above_baseline_pt = 18.0;
-            bb.below_baseline_pt = 4.0;
-        }
-        "=" => {
-            bb.w_pt = 12.0;
-            bb.above_baseline_pt = 4.0;
-            bb.below_baseline_pt = 2.0;
-        }
-        "(" | ")" => {
-            bb.w_pt = 5.0;
-            bb.above_baseline_pt = 12.0;
-            bb.below_baseline_pt = 3.0;
-        }
-        // Greek/math italic letters.
-        "𝜁" | "𝑠" | "n" | "s" => {
-            bb.w_pt = 8.0;
-            bb.above_baseline_pt = 10.0;
-            bb.below_baseline_pt = 3.0;
-        }
-        // Digits.
-        "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
-            bb.w_pt = 6.0;
-            bb.above_baseline_pt = 8.0;
-            bb.below_baseline_pt = 2.0;
-        }
-        _ => {
-            // Slightly taller for multi-char.
-            if n > 1.0 {
-                bb.above_baseline_pt = 9.0;
-            }
-        }
+        // The exact signature in typst 0.14 is: font.edges(top_edge, bottom_edge, size, bounds).
+        // We don't have access to the full style chain here, so we pick common defaults:
+        // - top_edge / bottom_edge are resolved by Typst's text system internally; for debug,
+        //   we approximate using `TextEdgeBounds`.
+        //
+        // As a best-effort, if edges aren't accessible, we just keep defaults.
+        let (t, b) = text.font.edges(
+            TopEdge::Metric(TopEdgeMetric::Bounds),
+            BottomEdge::Metric(BottomEdgeMetric::Bounds),
+            text.size,
+            bounds,
+        );
+        above = t.to_pt() as f32;
+        below = (-b.to_pt() as f32).max(0.0);
     }
 
-    bb
+    // Guard against nonsense.
+    if !w_pt.is_finite() || w_pt <= 0.0 {
+        w_pt = 6.0;
+    }
+    if !above.is_finite() || above <= 0.0 {
+        above = 8.0;
+    }
+    if !below.is_finite() || below < 0.0 {
+        below = 2.0;
+    }
+
+    // Clamp so one weird glyph doesn't blow up framing.
+    w_pt = w_pt.clamp(2.0, 200.0);
+    above = above.clamp(2.0, 80.0);
+    below = below.clamp(0.0, 80.0);
+
+    // If the run is very narrow, use a minimum width so punctuation remains visible.
+    w_pt = w_pt.max(3.0);
+
+    BaselineBox {
+        w_pt,
+        above_baseline_pt: above,
+        below_baseline_pt: below,
+        scale: 1.0,
+    }
 }
 
 /// Convert a Typst `Transform` into our `scene::Affine2`.
