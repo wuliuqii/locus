@@ -105,10 +105,11 @@ impl State {
         // Log extraction stats once at startup so `timeout ... cargo run --example typst_zeta`
         // still gives useful feedback even if the window is killed quickly.
         log::info!(
-            "typst_zeta: extracted lines={} text_dbg_rects={} glyph_tris={} groups={} shapes={} texts={} pages={}",
+            "typst_zeta: extracted lines={} text_dbg_rects={} glyph_tris={} glyph_tess_calls={} groups={} shapes={} texts={} pages={}",
             stats.lines,
             stats.text_debug_rects,
             stats.glyph_triangles,
+            stats.glyph_tess_calls,
             stats.groups,
             stats.shapes,
             stats.texts,
@@ -290,6 +291,7 @@ struct ExtractStats {
     lines: usize,
     text_debug_rects: usize,
     glyph_triangles: usize,
+    glyph_tess_calls: usize,
 
     // Debug-only: how many text items we classified as scripts (sub/sup) vs. normal.
     text_script: usize,
@@ -624,16 +626,23 @@ fn append_glyph_outlines(
                 + world_from_item_2x3.ty,
         };
 
+        // Track triangle count precisely by measuring mesh index growth for this glyph.
+        let before_indices = mesh.indices.len();
+
         let _ = locus::font::tessellate::append_tessellated_path(
             mesh,
             &path,
             composed,
             locus::font::tessellate::TessellateOptions::default(),
         );
-        // We can't precisely count triangles without inspecting the indices delta; approximate by
-        // using current index length / 3 at end of extraction (done elsewhere). Here we increment
-        // a coarse counter.
-        stats.glyph_triangles += 1;
+
+        let after_indices = mesh.indices.len();
+        let added_indices = after_indices.saturating_sub(before_indices);
+
+        // Each triangle is 3 indices.
+        stats.glyph_triangles += added_indices / 3;
+        stats.glyph_tess_calls += 1;
+
         pen_x_pt += adv_pt;
     }
 }
