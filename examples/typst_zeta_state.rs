@@ -9,13 +9,17 @@
 //! - Extract:
 //!   - `Shape::Line(...)` items and render them as stroked rectangles (very thin quads)
 //!   - `Text` items into:
-//!     - baseline-relative debug rectangles (run-level)
-//!     - REAL glyph outlines (per-glyph), tessellated into triangles
+//!     - baseline-relative debug rectangles (run-level; optional overlay)
+//!     - REAL glyph outlines (per-glyph), tessellated into triangles (optional)
+//!
+//! Debug toggles (environment variables):
+//! - `LOCUS_TY_ZETA_SHOW_TEXT_DBG=0|1` (default: 0)
+//! - `LOCUS_TY_ZETA_SHOW_GLYPHS=0|1`   (default: 1)
+//! - `LOCUS_TY_ZETA_SHOW_LINES=0|1`    (default: 1)
 //!
 //! Notes:
 //! - Typst's coordinate system here is page-local in `pt` units.
 //! - We accumulate `Group.transform` and item positions so rules render in correct locations.
-//! - Text debug boxes are baseline-relative and scaled by an inferred script level.
 //!
 //! Glyph outline rendering strategy:
 //! - For each `TextItem`, iterate `text.glyphs`
@@ -34,6 +38,17 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+
+fn env_flag(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "y" | "on" => true,
+            "0" | "false" | "no" | "n" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
 
 use anyhow::Context as _;
 use winit::window::Window;
@@ -130,54 +145,65 @@ impl State {
             compiled.document.pages.len()
         );
 
+        // Environment toggles (see module docs).
+        let show_lines = env_flag("LOCUS_TY_ZETA_SHOW_LINES", true);
+        let show_text_dbg = env_flag("LOCUS_TY_ZETA_SHOW_TEXT_DBG", false);
+        let show_glyphs = env_flag("LOCUS_TY_ZETA_SHOW_GLYPHS", true);
+
         // Add to scene (world/local are in pt).
-        scene.add_root(
-            Mobject2D::new("typst_lines")
-                .with_mesh(line_mesh)
-                .with_fill(Rgba {
-                    r: 0.90,
-                    g: 0.90,
-                    b: 0.95,
-                    a: 1.0,
-                }),
-        );
+        if show_lines {
+            scene.add_root(
+                Mobject2D::new("typst_lines")
+                    .with_mesh(line_mesh)
+                    .with_fill(Rgba {
+                        r: 0.90,
+                        g: 0.90,
+                        b: 0.95,
+                        a: 1.0,
+                    }),
+            );
+        }
 
-        // Debug overlay: baseline-relative text boxes.
-        scene.add_root(
-            Mobject2D::new("typst_text_dbg")
-                .with_mesh(text_dbg_mesh)
-                .with_fill(Rgba {
-                    r: 0.30,
-                    g: 0.85,
-                    b: 0.95,
-                    a: 0.40,
-                }),
-        );
+        if show_text_dbg {
+            // Debug overlay: baseline-relative text boxes.
+            scene.add_root(
+                Mobject2D::new("typst_text_dbg")
+                    .with_mesh(text_dbg_mesh)
+                    .with_fill(Rgba {
+                        r: 0.30,
+                        g: 0.85,
+                        b: 0.95,
+                        a: 0.40,
+                    }),
+            );
+        }
 
-        // Glyph outlines (tessellated fill).
-        scene.add_root(
-            Mobject2D::new("typst_glyphs")
-                .with_mesh(glyph_mesh)
-                .with_fill(Rgba {
-                    r: 0.95,
-                    g: 0.95,
-                    b: 0.95,
-                    a: 1.0,
-                }),
-        );
+        if show_glyphs {
+            // Glyph outlines (tessellated fill).
+            scene.add_root(
+                Mobject2D::new("typst_glyphs")
+                    .with_mesh(glyph_mesh)
+                    .with_fill(Rgba {
+                        r: 0.95,
+                        g: 0.95,
+                        b: 0.95,
+                        a: 1.0,
+                    }),
+            );
+        }
 
         // Frame the camera around extracted geometry (prefer glyph outlines if present).
-        if stats.glyph_triangles > 0 {
+        if show_glyphs && stats.glyph_triangles > 0 {
             if let Some(root) = scene.get("typst_glyphs") {
                 let bounds = root.compute_local_bounds();
                 scene.camera.frame_bounds(bounds, 60.0, 0.85);
             }
-        } else if stats.text_debug_rects > 0 {
+        } else if show_text_dbg && stats.text_debug_rects > 0 {
             if let Some(root) = scene.get("typst_text_dbg") {
                 let bounds = root.compute_local_bounds();
                 scene.camera.frame_bounds(bounds, 60.0, 0.85);
             }
-        } else if stats.lines > 0 {
+        } else if show_lines && stats.lines > 0 {
             if let Some(root) = scene.get("typst_lines") {
                 let bounds = root.compute_local_bounds();
                 // Conservative padding; rules can be thin so give it some breathing room.
