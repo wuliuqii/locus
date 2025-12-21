@@ -8,6 +8,8 @@
 //! - Traverse the resulting `PagedDocument` frames.
 //! - Extract:
 //!   - `Shape::Line(...)` items and render them as stroked rectangles (very thin quads)
+//!   - `Shape::Rect(...)` items and render them as filled quads (top-left origin)
+//!   - `Shape::Curve(...)` items and render them as filled curves (Move/Line/Cubic/Close)
 //!   - `Text` items into:
 //!     - baseline-relative debug rectangles (run-level; optional overlay)
 //!     - REAL glyph outlines (per-glyph), tessellated into triangles (optional)
@@ -16,6 +18,7 @@
 //! - `LOCUS_TY_ZETA_SHOW_TEXT_DBG=0|1` (default: 0)
 //! - `LOCUS_TY_ZETA_SHOW_GLYPHS=0|1`   (default: 1)
 //! - `LOCUS_TY_ZETA_SHOW_LINES=0|1`    (default: 1)
+//! - `LOCUS_TY_ZETA_SHOW_SHAPES=0|1`   (default: 1)
 //!
 //! Notes:
 //! - Typst's coordinate system here is page-local in `pt` units.
@@ -27,6 +30,10 @@
 //!   - Extract outline from Typst's `Font` (TTF face) using the glyph ID
 //!   - Tessellate outline via lyon into `scene::Mesh2D`
 //!   - Place it using pen position + glyph offsets, then apply `world_from_item`
+//!
+//! Shape rendering strategy:
+//! - We tessellate `Curve` geometry into a lyon `Path` and fill it.
+//! - For `Rect`, we generate a rectangle `Path` and fill it.
 //!
 //! Performance note:
 //! - This demo can tessellate many glyph outlines at startup.
@@ -58,6 +65,7 @@ use locus::{
     scene::{Affine2, Mesh2D, Mobject2D, Rgba, Scene2D},
 };
 
+use lyon::math::point as lyon_point;
 use lyon::path::Path;
 
 // In this file we need Typst's public types (`layout`, `visualize`).
@@ -104,9 +112,11 @@ impl State {
         // Extract primitives from the compiled document.
         //
         // - `line_mesh`: fraction bars / rule strokes (as thin quads)
+        // - `shape_mesh`: filled shapes (rect/curve) tessellated into triangles
         // - `text_dbg_mesh`: baseline-relative text boxes (debug overlay)
         // - `glyph_mesh`: real glyph outlines tessellated into triangles
         let mut line_mesh = Mesh2D::default();
+        let mut shape_mesh = Mesh2D::default();
         let mut text_dbg_mesh = Mesh2D::default();
         let mut glyph_mesh = Mesh2D::default();
 
@@ -122,6 +132,7 @@ impl State {
         extract_primitives_into_meshes(
             &compiled.document,
             &mut line_mesh,
+            &mut shape_mesh,
             &mut text_dbg_mesh,
             &mut glyph_mesh,
             &mut glyph_cache,
@@ -133,8 +144,9 @@ impl State {
         // Log extraction stats once at startup so `timeout ... cargo run --example typst_zeta`
         // still gives useful feedback even if the window is killed quickly.
         log::info!(
-            "typst_zeta: extracted lines={} text_dbg_rects={} glyph_tris={} glyph_tess_calls={} glyph_calls={} groups={} shapes={} texts={} pages={}",
+            "typst_zeta: extracted lines={} filled_shapes={} text_dbg_rects={} glyph_tris={} glyph_tess_calls={} glyph_calls={} groups={} shapes={} texts={} pages={}",
             stats.lines,
+            stats.filled_shapes,
             stats.text_debug_rects,
             stats.glyph_triangles,
             stats.glyph_tess_calls,
@@ -149,6 +161,7 @@ impl State {
         let show_lines = env_flag("LOCUS_TY_ZETA_SHOW_LINES", true);
         let show_text_dbg = env_flag("LOCUS_TY_ZETA_SHOW_TEXT_DBG", false);
         let show_glyphs = env_flag("LOCUS_TY_ZETA_SHOW_GLYPHS", true);
+        let show_shapes = env_flag("LOCUS_TY_ZETA_SHOW_SHAPES", true);
 
         // Add to scene (world/local are in pt).
         if show_lines {
@@ -160,6 +173,21 @@ impl State {
                         g: 0.90,
                         b: 0.95,
                         a: 1.0,
+                    }),
+            );
+        }
+
+        // Optional: filled shapes (rect/curve) extracted from Typst.
+        if show_shapes {
+            // `shape_mesh` is appended during extraction; if empty, this is a no-op at render time.
+            scene.add_root(
+                Mobject2D::new("typst_shapes")
+                    .with_mesh(shape_mesh)
+                    .with_fill(Rgba {
+                        r: 0.95,
+                        g: 0.95,
+                        b: 0.95,
+                        a: 0.90,
                     }),
             );
         }
@@ -329,6 +357,7 @@ struct ExtractStats {
     texts: usize,
 
     lines: usize,
+    filled_shapes: usize,
     text_debug_rects: usize,
     glyph_triangles: usize,
     glyph_tess_calls: usize,
@@ -415,6 +444,7 @@ impl BaselineBox {
 fn extract_primitives_into_meshes(
     doc: &layout::PagedDocument,
     line_out: &mut Mesh2D,
+    shape_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
     glyph_dbg_out: &mut Mesh2D,
     glyph_cache: &mut GlyphMeshCache,
@@ -434,6 +464,7 @@ fn extract_primitives_into_meshes(
             Affine2::IDENTITY,
             ctx,
             line_out,
+            shape_out,
             text_dbg_out,
             glyph_dbg_out,
             glyph_cache,
@@ -449,6 +480,7 @@ fn walk_frame_for_primitives(
     world_from_frame: Affine2,
     ctx: ExtractCtx,
     line_out: &mut Mesh2D,
+    shape_out: &mut Mesh2D,
     text_dbg_out: &mut Mesh2D,
     glyph_dbg_out: &mut Mesh2D,
     glyph_cache: &mut GlyphMeshCache,
@@ -473,6 +505,7 @@ fn walk_frame_for_primitives(
                     world_from_group,
                     child_ctx,
                     line_out,
+                    shape_out,
                     text_dbg_out,
                     glyph_dbg_out,
                     glyph_cache,
@@ -487,7 +520,7 @@ fn walk_frame_for_primitives(
                     pos.x.to_pt() as f32,
                     pos.y.to_pt() as f32,
                 ));
-                extract_shape_lines(world_from_item, shape, line_out, stats);
+                extract_shape_geometry(world_from_item, shape, line_out, shape_out, stats);
             }
             layout::FrameItem::Text(text) => {
                 // For Phase A layout debugging, we draw:
@@ -553,27 +586,135 @@ fn walk_frame_for_primitives(
     }
 }
 
-fn extract_shape_lines(
+fn extract_shape_geometry(
     world_from_item: Affine2,
     shape: &visualize::Shape,
-    out: &mut Mesh2D,
+    line_out: &mut Mesh2D,
+    shape_out: &mut Mesh2D,
     stats: &mut ExtractStats,
 ) {
-    // We only support `geometry: Line(...)` for now.
-    if let visualize::Geometry::Line(delta) = &shape.geometry {
-        let (x0, y0) = world_from_item.transform_point(0.0, 0.0);
-        let (x1, y1) =
-            world_from_item.transform_point(delta.x.to_pt() as f32, delta.y.to_pt() as f32);
+    match &shape.geometry {
+        visualize::Geometry::Line(delta) => {
+            let (x0, y0) = world_from_item.transform_point(0.0, 0.0);
+            let (x1, y1) =
+                world_from_item.transform_point(delta.x.to_pt() as f32, delta.y.to_pt() as f32);
 
-        let thickness_pt = shape
-            .stroke
-            .as_ref()
-            .map(|s| s.thickness.to_pt() as f32)
-            .unwrap_or(0.75)
-            .max(0.25);
+            let thickness_pt = shape
+                .stroke
+                .as_ref()
+                .map(|s| s.thickness.to_pt() as f32)
+                .unwrap_or(0.75)
+                .max(0.25);
 
-        append_line_as_rect(out, [x0, y0], [x1, y1], thickness_pt);
-        stats.lines += 1;
+            append_line_as_rect(line_out, [x0, y0], [x1, y1], thickness_pt);
+            stats.lines += 1;
+        }
+
+        visualize::Geometry::Rect(size) => {
+            // Rect has its origin at the top-left corner in Typst.
+            // We'll tessellate a rectangle path and fill it.
+            let w = size.x.to_pt() as f32;
+            let h = size.y.to_pt() as f32;
+
+            let mut b = Path::builder();
+            b.begin(lyon_point(0.0, 0.0));
+            b.line_to(lyon_point(w, 0.0));
+            b.line_to(lyon_point(w, h));
+            b.line_to(lyon_point(0.0, h));
+            b.close();
+            let path = b.build();
+
+            let xf = locus::font::tessellate::Affine2x3 {
+                a: world_from_item.m[0][0],
+                b: world_from_item.m[0][1],
+                c: world_from_item.m[1][0],
+                d: world_from_item.m[1][1],
+                tx: world_from_item.m[2][0],
+                ty: world_from_item.m[2][1],
+            };
+
+            let before = shape_out.indices.len();
+            let _ = locus::font::tessellate::append_tessellated_path(
+                shape_out,
+                &path,
+                xf,
+                locus::font::tessellate::TessellateOptions::default(),
+            );
+            let after = shape_out.indices.len();
+            if after > before {
+                stats.filled_shapes += 1;
+            }
+        }
+
+        visualize::Geometry::Curve(curve) => {
+            // Convert Typst curve items into a lyon path.
+            // Points are relative to the item's origin.
+            let mut b = Path::builder();
+            let mut started = false;
+
+            for item in curve.0.iter() {
+                match item {
+                    visualize::CurveItem::Move(p) => {
+                        if started {
+                            b.close();
+                        }
+                        b.begin(lyon_point(p.x.to_pt() as f32, p.y.to_pt() as f32));
+                        started = true;
+                    }
+                    visualize::CurveItem::Line(p) => {
+                        if !started {
+                            b.begin(lyon_point(0.0, 0.0));
+                            started = true;
+                        }
+                        b.line_to(lyon_point(p.x.to_pt() as f32, p.y.to_pt() as f32));
+                    }
+                    visualize::CurveItem::Cubic(p1, p2, p) => {
+                        if !started {
+                            b.begin(lyon_point(0.0, 0.0));
+                            started = true;
+                        }
+                        b.cubic_bezier_to(
+                            lyon_point(p1.x.to_pt() as f32, p1.y.to_pt() as f32),
+                            lyon_point(p2.x.to_pt() as f32, p2.y.to_pt() as f32),
+                            lyon_point(p.x.to_pt() as f32, p.y.to_pt() as f32),
+                        );
+                    }
+                    visualize::CurveItem::Close => {
+                        if started {
+                            b.close();
+                            started = false;
+                        }
+                    }
+                }
+            }
+
+            if started {
+                b.close();
+            }
+
+            let path = b.build();
+
+            let xf = locus::font::tessellate::Affine2x3 {
+                a: world_from_item.m[0][0],
+                b: world_from_item.m[0][1],
+                c: world_from_item.m[1][0],
+                d: world_from_item.m[1][1],
+                tx: world_from_item.m[2][0],
+                ty: world_from_item.m[2][1],
+            };
+
+            let before = shape_out.indices.len();
+            let _ = locus::font::tessellate::append_tessellated_path(
+                shape_out,
+                &path,
+                xf,
+                locus::font::tessellate::TessellateOptions::default(),
+            );
+            let after = shape_out.indices.len();
+            if after > before {
+                stats.filled_shapes += 1;
+            }
+        }
     }
 }
 
