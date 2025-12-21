@@ -11,6 +11,9 @@
 pub mod engine;
 pub mod math;
 
+// Reusable Typst → Scene extraction/tessellation pipeline.
+pub mod render;
+
 /// A tiny, renderer-friendly output for "math-only" mode.
 ///
 /// In Phase A we only need 2D geometry, no images/gradients/links.
