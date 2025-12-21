@@ -15,8 +15,13 @@
 //!   - Tessellate outline via lyon into `scene::Mesh2D`
 //! - Basic glyph mesh caching keyed by (glyph id, scale bits).
 //!
+//! New in this iteration:
+//! - Produce **colored draw items** rather than a few monolithic meshes.
+//! - Map basic Typst paints (solid colors) for fills/strokes.
+//!
 //! Notes / limitations:
-//! - Fill/stroke paints are currently ignored; caller supplies colors via scene objects.
+//! - Paint mapping is best-effort: we currently handle solid colors (`Paint::Solid`).
+//! - Gradient/image paints are ignored for now.
 //! - `Shape::Line` is still approximated as a quad using stroke thickness.
 //! - Performance tuning (shared tessellator, better cache keys, atlas-like caches) is future work.
 
@@ -28,11 +33,11 @@ use std::{
 use lyon::math::point as lyon_point;
 use lyon::path::Path;
 
-use crate::scene::{Affine2, Mesh2D};
+use crate::scene::{Affine2, DrawItem2D, Mesh2D, Rgba};
 use typst::{
-    layout::{Abs, Frame, FrameItem, PagedDocument, Point, Transform},
+    layout::{Frame, FrameItem, PagedDocument, Transform},
     text::TextItem,
-    visualize::{CurveItem, Geometry, Shape},
+    visualize::{CurveItem, Geometry, Paint, Shape},
 };
 
 /// Options controlling extraction behavior.
@@ -66,7 +71,9 @@ impl Default for RenderOptions {
     }
 }
 
-/// Output meshes from extraction.
+/// Output meshes from extraction (legacy grouping).
+///
+/// Prefer [`build_draw_items_from_paged_document`] for color-aware draw items.
 #[derive(Debug, Default)]
 pub struct ExtractedMeshes {
     /// Filled glyph outlines (tessellated triangles).
@@ -77,6 +84,14 @@ pub struct ExtractedMeshes {
     pub lines: Mesh2D,
     /// Optional debug overlay for text item extents (baseline-relative boxes).
     pub text_debug: Mesh2D,
+}
+
+/// A color-aware extraction output: a list of draw items (mesh + transform + fill + z).
+///
+/// This is the recommended output for rendering because it keeps per-item colors intact.
+#[derive(Debug, Default)]
+pub struct ExtractedDrawItems {
+    pub items: Vec<DrawItem2D>,
 }
 
 /// Basic extraction stats for logging / profiling.
@@ -95,7 +110,9 @@ pub struct ExtractStats {
     pub glyph_triangles: usize,
 }
 
-/// Build meshes from a compiled Typst `PagedDocument`.
+/// Build meshes from a compiled Typst `PagedDocument` (legacy grouping output).
+///
+/// Prefer [`build_draw_items_from_paged_document`] to keep per-item colors.
 pub fn build_meshes_from_paged_document(
     doc: &PagedDocument,
     opts: &RenderOptions,
@@ -116,6 +133,39 @@ pub fn build_meshes_from_paged_document(
             opts,
             &mut cache,
             &mut out,
+            &mut stats,
+        );
+    }
+
+    (out, stats)
+}
+
+/// Build draw items (mesh + fill color + transform) from a compiled Typst `PagedDocument`.
+///
+/// This preserves basic per-shape colors (`Paint::Solid`) for fills/strokes.
+///
+/// - For fills, we emit filled meshes with `fill` color.
+/// - For strokes, we currently only support `Geometry::Line` as a quad; other strokes are ignored.
+pub fn build_draw_items_from_paged_document(
+    doc: &PagedDocument,
+    opts: &RenderOptions,
+) -> (ExtractedDrawItems, ExtractStats) {
+    let mut out = ExtractedDrawItems::default();
+    let mut stats = ExtractStats::default();
+
+    stats.pages = doc.pages.len();
+
+    let mut cache = GlyphMeshCache::default();
+    let ctx = ExtractCtx::default();
+
+    for page in &doc.pages {
+        walk_frame_draw_items(
+            &page.frame,
+            Affine2::IDENTITY,
+            ctx,
+            opts,
+            &mut cache,
+            &mut out.items,
             &mut stats,
         );
     }
@@ -210,6 +260,79 @@ fn walk_frame(
                         opts,
                         stats,
                     );
+                }
+            }
+
+            _ => {}
+        }
+    }
+}
+
+/// Walk frames and emit color-aware draw items.
+fn walk_frame_draw_items(
+    frame: &Frame,
+    world_from_frame: Affine2,
+    ctx: ExtractCtx,
+    opts: &RenderOptions,
+    cache: &mut GlyphMeshCache,
+    out: &mut Vec<DrawItem2D>,
+    stats: &mut ExtractStats,
+) {
+    for (pos, item) in frame.items() {
+        match item {
+            FrameItem::Group(group) => {
+                stats.groups += 1;
+                let world_from_group =
+                    world_from_frame.mul(affine2_from_typst_transform(group.transform));
+                let child_ctx = ctx.with_group_transform(group.transform);
+                walk_frame_draw_items(
+                    &group.frame,
+                    world_from_group,
+                    child_ctx,
+                    opts,
+                    cache,
+                    out,
+                    stats,
+                );
+            }
+
+            FrameItem::Shape(shape, _span) => {
+                stats.shapes_seen += 1;
+                let world_from_item = world_from_frame.mul(Affine2::translate(
+                    pos.x.to_pt() as f32,
+                    pos.y.to_pt() as f32,
+                ));
+                extract_shape_draw_items(world_from_item, shape, opts, out, stats);
+            }
+
+            FrameItem::Text(text) => {
+                stats.texts_seen += 1;
+                let world_from_item = world_from_frame.mul(Affine2::translate(
+                    pos.x.to_pt() as f32,
+                    pos.y.to_pt() as f32,
+                ));
+
+                if opts.enable_glyphs {
+                    // Tessellate glyphs directly into one mesh, then emit a draw item.
+                    let mut glyph_mesh = Mesh2D::default();
+                    let before = glyph_mesh.indices.len();
+                    append_text_glyph_outlines(
+                        &mut glyph_mesh,
+                        cache,
+                        world_from_item,
+                        text,
+                        ctx.script_scale(),
+                        opts,
+                        stats,
+                    );
+                    if glyph_mesh.indices.len() > before {
+                        out.push(DrawItem2D {
+                            mesh: glyph_mesh,
+                            fill: Rgba::WHITE,
+                            world_from_local: Affine2::IDENTITY,
+                            z: 0,
+                        });
+                    }
                 }
             }
 
@@ -334,6 +457,143 @@ fn extract_shape(
         }
 
         _ => {}
+    }
+}
+
+/// Map a Typst `Paint` to a scene color (best-effort).
+fn paint_to_rgba(paint: &Paint) -> Option<Rgba> {
+    match paint {
+        Paint::Solid(c) => {
+            // typst 0.14 uses palette types. `to_rgb()` returns an `Alpha<Rgb, f32>`-like type
+            // with `red/green/blue` fields and a separate `alpha`.
+            let rgba = c.to_rgb();
+            Some(Rgba {
+                r: rgba.red as f32,
+                g: rgba.green as f32,
+                b: rgba.blue as f32,
+                a: rgba.alpha as f32,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Extract a shape into colored draw items.
+fn extract_shape_draw_items(
+    world_from_item: Affine2,
+    shape: &Shape,
+    opts: &RenderOptions,
+    out: &mut Vec<DrawItem2D>,
+    stats: &mut ExtractStats,
+) {
+    // Fill
+    if opts.enable_shapes {
+        if let Some(fill) = shape.fill.as_ref().and_then(paint_to_rgba) {
+            // Tessellate geometry into a mesh and emit.
+            let mut mesh = Mesh2D::default();
+            let xf = affine2x3_from_scene(world_from_item);
+
+            let path = match &shape.geometry {
+                Geometry::Rect(size) => {
+                    let w = size.x.to_pt() as f32;
+                    let h = size.y.to_pt() as f32;
+                    let mut b = Path::builder();
+                    b.begin(lyon_point(0.0, 0.0));
+                    b.line_to(lyon_point(w, 0.0));
+                    b.line_to(lyon_point(w, h));
+                    b.line_to(lyon_point(0.0, h));
+                    b.close();
+                    b.build()
+                }
+                Geometry::Curve(curve) => {
+                    let mut b = Path::builder();
+                    let mut started = false;
+                    for item in curve.0.iter() {
+                        match item {
+                            CurveItem::Move(p) => {
+                                if started {
+                                    b.close();
+                                }
+                                b.begin(lyon_point(p.x.to_pt() as f32, p.y.to_pt() as f32));
+                                started = true;
+                            }
+                            CurveItem::Line(p) => {
+                                if !started {
+                                    b.begin(lyon_point(0.0, 0.0));
+                                    started = true;
+                                }
+                                b.line_to(lyon_point(p.x.to_pt() as f32, p.y.to_pt() as f32));
+                            }
+                            CurveItem::Cubic(p1, p2, p) => {
+                                if !started {
+                                    b.begin(lyon_point(0.0, 0.0));
+                                    started = true;
+                                }
+                                b.cubic_bezier_to(
+                                    lyon_point(p1.x.to_pt() as f32, p1.y.to_pt() as f32),
+                                    lyon_point(p2.x.to_pt() as f32, p2.y.to_pt() as f32),
+                                    lyon_point(p.x.to_pt() as f32, p.y.to_pt() as f32),
+                                );
+                            }
+                            CurveItem::Close => {
+                                if started {
+                                    b.close();
+                                    started = false;
+                                }
+                            }
+                        }
+                    }
+                    if started {
+                        b.close();
+                    }
+                    b.build()
+                }
+                _ => return,
+            };
+
+            let before = mesh.indices.len();
+            let _ = crate::font::tessellate::append_tessellated_path(
+                &mut mesh,
+                &path,
+                xf,
+                crate::font::tessellate::TessellateOptions {
+                    tolerance: opts.tolerance,
+                    ..Default::default()
+                },
+            );
+            if mesh.indices.len() > before {
+                out.push(DrawItem2D {
+                    mesh,
+                    fill,
+                    world_from_local: Affine2::IDENTITY,
+                    z: 0,
+                });
+                stats.filled_shapes_emitted += 1;
+            }
+        }
+    }
+
+    // Stroke-only lines (best-effort)
+    if opts.enable_lines {
+        if let Geometry::Line(delta) = &shape.geometry {
+            if let Some(stroke) = shape.stroke.as_ref() {
+                if let Some(color) = paint_to_rgba(&stroke.paint) {
+                    let (x0, y0) = world_from_item.transform_point(0.0, 0.0);
+                    let (x1, y1) = world_from_item
+                        .transform_point(delta.x.to_pt() as f32, delta.y.to_pt() as f32);
+                    let thickness_pt = stroke.thickness.to_pt() as f32;
+                    let mut mesh = Mesh2D::default();
+                    append_line_as_rect(&mut mesh, [x0, y0], [x1, y1], thickness_pt.max(0.25));
+                    out.push(DrawItem2D {
+                        mesh,
+                        fill: color,
+                        world_from_local: Affine2::IDENTITY,
+                        z: 0,
+                    });
+                    stats.lines_emitted += 1;
+                }
+            }
+        }
     }
 }
 
