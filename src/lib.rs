@@ -8,6 +8,7 @@
 //! - Provide a couple of stable entrypoints (`run_app`, `compile_math_only`) that mirror
 //!   the current demos and are useful for integration tests / bring-up.
 
+pub mod anim;
 pub mod font;
 pub mod render;
 pub mod scene;
