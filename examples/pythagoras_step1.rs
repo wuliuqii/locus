@@ -2,7 +2,10 @@
 //!
 //! Goal of this step:
 //! - Show a right triangle on the left.
-//! - Fade in labels "a", "b", "c".
+//! - Fade in labels "a", "b", "c", and the equation `a^2 + b^2 = c^2`.
+//! - When the equation appears, dim the triangle to shift attention.
+//! - Highlight the hypotenuse with a bright stroke (`edge_c`) alongside the equation.
+//! - Subtly scale the equation in as it fades.
 //! - Move the labels slightly into place to demonstrate animation basics.
 //!
 //! Run (recommended to avoid blocking your terminal session):
@@ -12,7 +15,13 @@
 //! - This demo is intentionally simple. It focuses on wiring the `anim::Timeline` into the
 //!   winit render loop and animating `Mobject2D` properties.
 //! - Geometry here is basic CPU meshes (triangles/quads) built directly.
-//! - Later steps will replace labels with Typst-rendered math and add more complex constructions.
+//! - Labels are rendered as Typst glyph outline meshes.
+//! - With alpha propagation in scene flatten, we keep Typst child mesh alpha at 1.0 and animate
+//!   only the group/root alpha via the Timeline.
+//!
+//! Debugging:
+//! - This example includes a one-time stderr dump of flattened draw items (mesh sizes, color, z,
+//!   and world_from_local matrix) to diagnose blank-screen issues after transform refactors.
 
 use std::{sync::Arc, time::Instant};
 
@@ -23,7 +32,11 @@ use locus::{
     anim::{AnimTarget, Ease, Keyframe, Timeline, Track},
     render::{app::AppState, gpu::Gpu, mesh_renderer::MeshRenderer},
     scene::{Affine2, Mesh2D, Mobject2D, Rgba, Scene2D},
+    typst::demo::{TypstGroupOptions, compile_snippet_to_group_mobject_baseline},
 };
+
+// One-time debug dump to stderr (kept local to this example).
+static DEBUG_DUMP_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// Demo state for step 1.
 pub struct State {
@@ -49,7 +62,7 @@ impl State {
             .camera
             .set_viewport_px(gpu.size.width.max(1), gpu.size.height.max(1));
 
-        // --- Build geometry (triangle + simple label blocks) ---
+        // --- Build geometry (triangle + Typst labels as baseline-anchored group mobjects) ---
         //
         // Coordinate convention:
         // - world units are pt
@@ -58,61 +71,151 @@ impl State {
         let tri = right_triangle_mesh([0.0, 0.0], 240.0, 160.0);
 
         // Triangle object.
+        scene.add_root(Mobject2D::new("tri").with_mesh(tri).with_fill(Rgba {
+            r: 0.20,
+            g: 0.25,
+            b: 0.30,
+            a: 1.0,
+        }));
+
+        // Highlight the hypotenuse (edge c) as a thin rectangle (stroke approximation).
+        // Right triangle vertices:
+        // - O = (0, 0)
+        // - A = (a, 0) = (240, 0)
+        // - B = (0, b) = (0, 160)
+        //
+        // Hypotenuse is A -> B.
         scene.add_root(
-            Mobject2D::new("tri")
-                .with_mesh(tri)
+            Mobject2D::new("edge_c")
+                .with_mesh(line_as_rect_mesh([240.0, 0.0], [0.0, 160.0], 2.5))
                 .with_fill(Rgba {
-                    r: 0.20,
-                    g: 0.25,
-                    b: 0.30,
-                    a: 1.0,
+                    r: 0.95,
+                    g: 0.95,
+                    b: 0.96,
+                    a: 0.0,
                 }),
         );
 
-        // Labels as simple rectangles for now (we'll replace with Typst text in step 2).
-        // Start them slightly offset and fully transparent; animation will move + fade them in.
-        scene.add_root(label_block(
-            "label_a",
-            [-40.0, 70.0],
-            [22.0, 14.0],
-            Rgba {
-                r: 0.90,
-                g: 0.55,
-                b: 0.25,
-                a: 0.0,
+        // Labels as Typst-rendered glyph outline meshes (baseline-anchored groups).
+        //
+        // Important: we keep the same root names ("label_a"/"label_b"/"label_c"/"label_eq") so the Timeline
+        // tracks continue to target the correct objects.
+        //
+        // Visibility note:
+        // - The Typst glyph triangles live on the child mesh node.
+        // - `Timeline` animates `fill.a` on the target root/group.
+        // - Scene flatten propagates parent alpha down the tree.
+        //
+        // Therefore:
+        // - keep child mesh alpha at 1.0
+        // - initialize the group alpha at 0.0 and let the Timeline fade the whole group in
+        let mut label_a = compile_snippet_to_group_mobject_baseline(
+            "$a$",
+            TypstGroupOptions {
+                name: "label_a".to_string(),
+                child_name: "mesh".to_string(),
+                fill: Rgba {
+                    r: 0.90,
+                    g: 0.55,
+                    b: 0.25,
+                    a: 1.0,
+                },
+                local_from_parent: Affine2::translate(-40.0, 70.0),
+                render: Default::default(),
+                include_shapes: false,
+                include_text_debug: false,
             },
-        ));
+        )
+        .context("failed to build typst label_a")?;
+        // Fade is driven by group/root alpha (propagated to children during flatten).
+        label_a.fill.a = 0.0;
+        scene.add_root(label_a);
 
-        scene.add_root(label_block(
-            "label_b",
-            [110.0, -20.0],
-            [22.0, 14.0],
-            Rgba {
-                r: 0.35,
-                g: 0.85,
-                b: 0.45,
-                a: 0.0,
+        let mut label_b = compile_snippet_to_group_mobject_baseline(
+            "$b$",
+            TypstGroupOptions {
+                name: "label_b".to_string(),
+                child_name: "mesh".to_string(),
+                fill: Rgba {
+                    r: 0.35,
+                    g: 0.85,
+                    b: 0.45,
+                    a: 1.0,
+                },
+                local_from_parent: Affine2::translate(110.0, -20.0),
+                render: Default::default(),
+                include_shapes: false,
+                include_text_debug: false,
             },
-        ));
+        )
+        .context("failed to build typst label_b")?;
+        // Fade is driven by group/root alpha (propagated to children during flatten).
+        label_b.fill.a = 0.0;
+        scene.add_root(label_b);
 
-        scene.add_root(label_block(
-            "label_c",
-            [70.0, 130.0],
-            [22.0, 14.0],
-            Rgba {
-                r: 0.45,
-                g: 0.65,
-                b: 0.95,
-                a: 0.0,
+        let mut label_c = compile_snippet_to_group_mobject_baseline(
+            "$c$",
+            TypstGroupOptions {
+                name: "label_c".to_string(),
+                child_name: "mesh".to_string(),
+                fill: Rgba {
+                    r: 0.45,
+                    g: 0.65,
+                    b: 0.95,
+                    a: 1.0,
+                },
+                local_from_parent: Affine2::translate(70.0, 130.0),
+                render: Default::default(),
+                include_shapes: false,
+                include_text_debug: false,
             },
-        ));
+        )
+        .context("failed to build typst label_c")?;
+        // Fade is driven by group/root alpha (propagated to children during flatten).
+        label_c.fill.a = 0.0;
+        scene.add_root(label_c);
 
-        // Frame camera around triangle + expected label area.
-        // We approximate by framing around the triangle's bounds.
-        if let Some(root) = scene.get("tri") {
-            let bounds = root.compute_local_bounds();
-            scene.camera.frame_bounds(bounds, 80.0, 0.85);
+        // Main equation label (baseline-anchored).
+        let mut label_eq = compile_snippet_to_group_mobject_baseline(
+            "$a^2 + b^2 = c^2$",
+            TypstGroupOptions {
+                name: "label_eq".to_string(),
+                child_name: "mesh".to_string(),
+                fill: Rgba {
+                    r: 0.95,
+                    g: 0.95,
+                    b: 0.96,
+                    a: 1.0,
+                },
+                // Start slightly lower and slightly smaller; Timeline will move + scale it into place.
+                local_from_parent: Affine2::translate(-10.0, 210.0).mul(Affine2::scale(0.96, 0.96)),
+                render: Default::default(),
+                include_shapes: false,
+                include_text_debug: false,
+            },
+        )
+        .context("failed to build typst label_eq")?;
+        // Fade is driven by group/root alpha (propagated to children during flatten).
+        label_eq.fill.a = 0.0;
+        scene.add_root(label_eq);
+
+        // Frame camera around triangle + all labels so Typst glyphs stay in view.
+        //
+        // NOTE: `compute_local_bounds()` includes children bounds (transforming their corners),
+        // so using it on the label group roots accounts for the glyph mesh child.
+        let mut frame_bounds = if let Some(root) = scene.get("tri") {
+            root.compute_local_bounds()
+        } else {
+            locus::scene::Aabb2::empty()
+        };
+
+        for name in ["label_a", "label_b", "label_c", "label_eq", "edge_c"] {
+            if let Some(root) = scene.get(name) {
+                frame_bounds = frame_bounds.union(root.compute_local_bounds());
+            }
         }
+
+        scene.camera.frame_bounds(frame_bounds, 80.0, 0.85);
 
         let base_zoom = scene.camera.zoom;
         let base_center = scene.camera.center_pt;
@@ -188,7 +291,46 @@ impl State {
             ]),
         );
 
-        let renderer = MeshRenderer::new(&gpu)?;
+        // Equation: fade in, scale in, and settle upward a bit (baseline-anchored).
+        timeline.add_track(
+            Track::new_alpha(AnimTarget::Name("label_eq".to_string())).with_keyframes(vec![
+                Keyframe::at(0.55, 0.0).ease(Ease::OutCubic),
+                Keyframe::at(1.25, 1.0).ease(Ease::OutCubic),
+            ]),
+        );
+        timeline.add_track(
+            Track::new_scale(AnimTarget::Name("label_eq".to_string())).with_keyframes(vec![
+                Keyframe::at(0.55, 0.96).ease(Ease::OutCubic),
+                Keyframe::at(1.35, 1.00).ease(Ease::OutCubic),
+            ]),
+        );
+        timeline.add_track(
+            Track::new_translate_y(AnimTarget::Name("label_eq".to_string())).with_keyframes(vec![
+                Keyframe::at(0.55, 210.0).ease(Ease::OutCubic),
+                Keyframe::at(1.35, 195.0).ease(Ease::OutCubic),
+            ]),
+        );
+
+        // When the equation appears, dim the triangle to shift attention.
+        timeline.add_track(
+            Track::new_alpha(AnimTarget::Name("tri".to_string())).with_keyframes(vec![
+                Keyframe::at(0.55, 1.0).ease(Ease::OutCubic),
+                Keyframe::at(1.35, 0.30).ease(Ease::OutCubic),
+            ]),
+        );
+
+        // Highlight the hypotenuse alongside the equation.
+        timeline.add_track(
+            Track::new_alpha(AnimTarget::Name("edge_c".to_string())).with_keyframes(vec![
+                Keyframe::at(0.55, 0.0).ease(Ease::OutCubic),
+                Keyframe::at(1.15, 1.0).ease(Ease::OutCubic),
+            ]),
+        );
+
+        let mut renderer = MeshRenderer::new(&gpu)?;
+        // Debug: draw a full-screen triangle in clip space to validate pipeline output.
+        // If you see a magenta triangle, the render pass + pipeline + presentation are working.
+        renderer.set_debug_fullscreen_triangle(true);
 
         Ok(Self {
             window,
@@ -214,9 +356,45 @@ impl State {
         let t = self.start_time.elapsed().as_secs_f32();
         self.timeline.apply(&mut self.scene, t);
 
-        // Keep camera stable for teaching (no breathing here), but allow future steps to animate camera.
-        self.scene.camera.zoom = self.base_zoom;
-        self.scene.camera.center_pt = self.base_center;
+        // Sanity-check mode:
+        // Force a fixed camera independent of any framing/bounds logic.
+        //
+        // If geometry still doesn't show up with this, the issue is likely in the camera->clip
+        // transform, matrix conventions, or the renderer pipeline (not camera framing).
+        self.scene.camera.center_pt = [120.0, 80.0];
+        self.scene.camera.zoom = 0.01;
+
+        // One-time debug dump of what we are about to draw (useful for diagnosing blank screens).
+        DEBUG_DUMP_ONCE.get_or_init(|| {
+            let items = self.scene.flatten();
+            let non_empty = items
+                .iter()
+                .filter(|it| !it.mesh.positions.is_empty() && !it.mesh.indices.is_empty())
+                .count();
+
+            eprintln!(
+                "[pythagoras_step1 debug] camera center={:?} zoom={} aspect={} items={} non_empty_items={}",
+                self.scene.camera.center_pt,
+                self.scene.camera.zoom,
+                self.scene.camera.viewport_aspect,
+                items.len(),
+                non_empty
+            );
+
+            for (i, it) in items.iter().enumerate() {
+                eprintln!(
+                    "[pythagoras_step1 debug] item[{i}] z={} color=({:.3},{:.3},{:.3},{:.3}) mesh(v={}, i={}) world_from_local={:?}",
+                    it.z,
+                    it.fill.r,
+                    it.fill.g,
+                    it.fill.b,
+                    it.fill.a,
+                    it.mesh.positions.len(),
+                    it.mesh.indices.len(),
+                    it.world_from_local.m
+                );
+            }
+        });
 
         let (surface_texture, view) = match self.gpu.acquire_frame() {
             Ok(v) => v,
@@ -317,31 +495,32 @@ fn right_triangle_mesh(origin: [f32; 2], a: f32, b: f32) -> Mesh2D {
     Mesh2D { positions, indices }
 }
 
+/// Approximate a line segment as a thin rectangle mesh (two triangles).
+fn line_as_rect_mesh(a: [f32; 2], b: [f32; 2], thickness_pt: f32) -> Mesh2D {
+    let dx = b[0] - a[0];
+    let dy = b[1] - a[1];
+    let len = (dx * dx + dy * dy).sqrt();
+
+    if len < 1e-6 {
+        return Mesh2D::default();
+    }
+
+    let nx = -dy / len;
+    let ny = dx / len;
+    let half = 0.5 * thickness_pt.max(0.25);
+
+    let p0 = [a[0] + nx * half, a[1] + ny * half];
+    let p1 = [a[0] - nx * half, a[1] - ny * half];
+    let p2 = [b[0] - nx * half, b[1] - ny * half];
+    let p3 = [b[0] + nx * half, b[1] + ny * half];
+
+    Mesh2D {
+        positions: vec![p0, p1, p2, p3],
+        indices: vec![0, 1, 2, 0, 2, 3],
+    }
+}
+
 /// Create a simple label block as a filled rectangle mesh, placed using local transform.
-fn label_block(name: &str, pos: [f32; 2], size: [f32; 2], color: Rgba) -> Mobject2D {
-    let mesh = rect_mesh_centered(size[0], size[1]);
-
-    Mobject2D::new(name)
-        .with_mesh(mesh)
-        .with_fill(color)
-        .with_transform(Affine2::translate(pos[0], pos[1]))
-}
-
-/// Create a centered rectangle mesh in local coordinates.
-fn rect_mesh_centered(w: f32, h: f32) -> Mesh2D {
-    let hw = 0.5 * w;
-    let hh = 0.5 * h;
-
-    let positions = vec![
-        [-hw, -hh],
-        [hw, -hh],
-        [hw, hh],
-        [-hw, hh],
-    ];
-
-    let indices = vec![0, 1, 2, 0, 2, 3];
-    Mesh2D { positions, indices }
-}
 
 /// Thin wrapper main: uses the library app runner with the demo state.
 fn main() -> anyhow::Result<()> {

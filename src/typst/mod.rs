@@ -14,6 +14,10 @@ pub mod math;
 // Reusable Typst → Scene extraction/tessellation pipeline.
 pub mod render;
 
+// Small ergonomic wrappers intended for demos/teaching scenarios.
+// (Not a stable public API yet.)
+pub mod demo;
+
 /// A tiny, renderer-friendly output for "math-only" mode.
 ///
 /// In Phase A we only need 2D geometry, no images/gradients/links.

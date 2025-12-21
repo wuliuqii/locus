@@ -379,10 +379,16 @@ impl Timeline {
                 continue;
             };
 
-            // Transform composition:
-            // local_from_parent' = T * R * S
-            // with column-vector convention and Affine2::mul applying rhs first.
-            // So: out = T.mul(R.mul(S))
+            // Transform composition for the animated layer:
+            // anim_from_parent = T * R * S
+            //
+            // IMPORTANT:
+            // We intentionally do NOT overwrite the static placement transform.
+            // Static layout/baseline anchoring lives in `base_from_parent`.
+            // Rendering composes: local_from_parent = base_from_parent * anim_from_parent.
+            //
+            // Track semantics remain "absolute" for the animated layer (i.e. tx/ty are absolute
+            // within anim space, not deltas).
             let s = p.sx.unwrap_or(1.0);
             let r = p.rot.unwrap_or(0.0);
             let tx = p.tx.unwrap_or(0.0);
@@ -392,7 +398,11 @@ impl Timeline {
             let xf_r = Affine2::rotate(r);
             let xf_t = Affine2::translate(tx, ty);
 
-            obj.local_from_parent = xf_t.mul(xf_r.mul(xf_s));
+            obj.anim_from_parent = xf_t.mul(xf_r.mul(xf_s));
+
+            // Keep the legacy/compat field in sync for any remaining call sites that read it
+            // directly (during migration).
+            obj.local_from_parent = obj.base_from_parent.mul(obj.anim_from_parent);
 
             if let Some(a) = p.alpha {
                 obj.fill.a = a.clamp(0.0, 1.0);

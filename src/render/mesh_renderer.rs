@@ -9,6 +9,11 @@
 //! - Let the camera provide the world->clip transform.
 //! - Allow per-item local transforms (world_from_local) and per-item fill color.
 //!
+//! Debug mode:
+//! - You can enable a "full-screen triangle" draw path to validate that the render pass,
+//!   pipeline, and surface presentation are working, independent of camera math and scene data.
+//! - This is intentionally simple and should only be used for debugging.
+//!
 //! Notes / current limitations:
 //! - Uses a uniform buffer that stores (mvp, color) and is updated per draw call.
 //! - No batching beyond "one draw per item" (fine for early phase; we can batch later).
@@ -123,9 +128,22 @@ pub struct MeshRenderer {
 
     index_buffer: wgpu::Buffer,
     index_capacity_bytes: u64,
+
+    /// If enabled, ignore scene items and draw a single full-screen triangle in clip-space.
+    ///
+    /// This is a debugging aid to validate that the render pipeline outputs pixels.
+    debug_fullscreen_triangle: bool,
 }
 
 impl MeshRenderer {
+    /// Enable or disable the full-screen triangle debug mode.
+    ///
+    /// When enabled, `draw_items()` will ignore the provided scene and render a single
+    /// magenta triangle directly in clip space.
+    pub fn set_debug_fullscreen_triangle(&mut self, enabled: bool) {
+        self.debug_fullscreen_triangle = enabled;
+    }
+
     /// Create a new renderer with a solid-color pipeline.
     ///
     /// This expects the surface format to be SRGB-view compatible; we target
@@ -244,6 +262,7 @@ impl MeshRenderer {
             vertex_capacity_bytes: initial_vb,
             index_buffer,
             index_capacity_bytes: initial_ib,
+            debug_fullscreen_triangle: false,
         })
     }
 
@@ -295,6 +314,83 @@ impl MeshRenderer {
     ) -> anyhow::Result<()> {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+
+        // Debug: render a full-screen triangle in clip space (no camera dependency).
+        //
+        // Use the conservative "big triangle" that covers the full viewport in NDC.
+        // Keeping vertices well within clip space avoids any surprises from precision
+        // or coordinate convention issues.
+        if self.debug_fullscreen_triangle {
+            let vertices = vec![
+                Vertex2D {
+                    position: [-1.0, -1.0],
+                },
+                Vertex2D {
+                    position: [1.0, -1.0],
+                },
+                Vertex2D {
+                    position: [-1.0, 1.0],
+                },
+                Vertex2D {
+                    position: [1.0, 1.0],
+                },
+            ];
+            let indices: Vec<u16> = vec![0, 1, 2, 2, 1, 3];
+
+            let vb_bytes = (vertices.len() * mem::size_of::<Vertex2D>()) as u64;
+            let ib_bytes = (indices.len() * mem::size_of::<u16>()) as u64;
+
+            let align = wgpu::COPY_BUFFER_ALIGNMENT;
+            let vb_upload = round_up_to(vb_bytes, align);
+            let ib_upload = round_up_to(ib_bytes, align);
+
+            self.ensure_capacity(gpu, vb_upload, ib_upload);
+
+            // Upload (padded) vertex data.
+            let v_raw = bytemuck::cast_slice(&vertices);
+            if vb_upload == vb_bytes {
+                gpu.queue.write_buffer(&self.vertex_buffer, 0, v_raw);
+            } else {
+                let mut padded = Vec::<u8>::with_capacity(vb_upload as usize);
+                padded.extend_from_slice(v_raw);
+                padded.resize(vb_upload as usize, 0);
+                gpu.queue.write_buffer(&self.vertex_buffer, 0, &padded);
+            }
+
+            // Upload (padded) index data.
+            let i_raw = bytemuck::cast_slice(&indices);
+            if ib_upload == ib_bytes {
+                gpu.queue.write_buffer(&self.index_buffer, 0, i_raw);
+            } else {
+                let mut padded = Vec::<u8>::with_capacity(ib_upload as usize);
+                padded.extend_from_slice(i_raw);
+                padded.resize(ib_upload as usize, 0);
+                gpu.queue.write_buffer(&self.index_buffer, 0, &padded);
+            }
+
+            // Identity MVP: positions are already in clip space.
+            let mvp = Affine2::IDENTITY.to_mat4();
+            let uniforms = SolidUniforms::new(
+                mvp,
+                Rgba {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 1.0,
+                    a: 1.0,
+                },
+            );
+            gpu.queue
+                .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..vb_bytes));
+            pass.set_index_buffer(
+                self.index_buffer.slice(..ib_bytes),
+                wgpu::IndexFormat::Uint16,
+            );
+            pass.draw_indexed(0..(indices.len() as u32), 0, 0..1);
+
+            return Ok(());
+        }
 
         // Precompute camera matrix (affine -> mat4).
         let clip_from_world = affine_to_mat4(camera.clip_from_world());

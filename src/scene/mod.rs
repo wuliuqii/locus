@@ -234,7 +234,7 @@ pub struct DrawItem2D {
 /// A "mobject": a node in the scene graph.
 ///
 /// Each node has:
-/// - a local transform
+/// - transforms relative to parent (static + animated)
 /// - children
 /// - optional geometry payload (meshes)
 ///
@@ -250,7 +250,21 @@ pub struct DrawItem2D {
 #[derive(Debug, Clone)]
 pub struct Mobject2D {
     pub name: String,
+
+    /// Static placement transform (baseline anchoring, layout positioning, etc.).
+    pub base_from_parent: Affine2,
+
+    /// Animated transform driven by `anim::Timeline` (defaults to identity).
+    pub anim_from_parent: Affine2,
+
+    /// Deprecated compatibility field.
+    ///
+    /// Historically we stored the single transform here. It is now computed as:
+    /// `local_from_parent = base_from_parent * anim_from_parent`.
+    ///
+    /// It is kept temporarily to reduce churn while migrating call sites.
     pub local_from_parent: Affine2,
+
     pub z: i32,
 
     pub fill: Rgba,
@@ -265,10 +279,22 @@ pub struct Mobject2D {
     pub local_bounds: Option<Aabb2>,
 }
 
+impl Mobject2D {
+    /// Compose the effective local transform from static placement and animated transform.
+    ///
+    /// Convention: column vectors, so applying `anim` after `base` is `base * anim`.
+    #[inline]
+    pub fn composed_local_from_parent(&self) -> Affine2 {
+        self.base_from_parent.mul(self.anim_from_parent)
+    }
+}
+
 impl Default for Mobject2D {
     fn default() -> Self {
         Self {
             name: "mobject".to_string(),
+            base_from_parent: Affine2::IDENTITY,
+            anim_from_parent: Affine2::IDENTITY,
             local_from_parent: Affine2::IDENTITY,
             z: 0,
             fill: Rgba::WHITE,
@@ -302,7 +328,14 @@ impl Mobject2D {
 
     #[inline]
     pub fn with_transform(mut self, local_from_parent: Affine2) -> Self {
-        self.local_from_parent = local_from_parent;
+        // Compatibility: treat `with_transform` as setting the static/base transform.
+        //
+        // Important: `with_transform` should not depend on the current animation state.
+        // Call sites expect this to set the *static placement* (baseline anchoring, layout).
+        self.base_from_parent = local_from_parent;
+
+        // Keep legacy/compat field in sync using the composed transform.
+        self.local_from_parent = self.base_from_parent.mul(self.anim_from_parent);
         self
     }
 
@@ -344,8 +377,14 @@ impl Mobject2D {
                 [child_bounds.min[0], child_bounds.max[1]],
             ];
 
+            // Compose child's local transform from (base * anim).
+            //
+            // NOTE: `local_from_parent` is a compatibility field; use the composed transform so
+            // camera framing matches rendered positions.
+            let child_local = child.base_from_parent.mul(child.anim_from_parent);
+
             for c in corners {
-                let (x, y) = child.local_from_parent.transform_point(c[0], c[1]);
+                let (x, y) = child_local.transform_point(c[0], c[1]);
                 bounds.include_point([x, y]);
             }
         }
@@ -355,19 +394,41 @@ impl Mobject2D {
 
     /// Flatten this subtree into draw items, composing transforms.
     pub fn flatten(&self, parent_from_world: Affine2, out: &mut Vec<DrawItem2D>) {
-        let world_from_local = parent_from_world.mul(self.local_from_parent);
+        self.flatten_with_parent_alpha(parent_from_world, 1.0, out);
+    }
+
+    /// Flatten this subtree into draw items, composing transforms and propagating alpha.
+    ///
+    /// We propagate alpha multiplicatively down the tree so that animating a parent/group's
+    /// `fill.a` affects all child meshes (e.g. Typst text groups).
+    fn flatten_with_parent_alpha(
+        &self,
+        parent_from_world: Affine2,
+        parent_alpha: f32,
+        out: &mut Vec<DrawItem2D>,
+    ) {
+        // Compose current local transform from static base and animated delta.
+        // IMPORTANT: do not use `local_from_parent` directly; it's a compatibility field.
+        let local_from_parent = self.composed_local_from_parent();
+        let world_from_local = parent_from_world.mul(local_from_parent);
+
+        // Multiply parent alpha into this node's fill alpha.
+        let alpha = (parent_alpha * self.fill.a).clamp(0.0, 1.0);
 
         if let Some(mesh) = &self.mesh {
+            let mut fill = self.fill;
+            fill.a = alpha;
+
             out.push(DrawItem2D {
                 mesh: mesh.clone(),
-                fill: self.fill,
+                fill,
                 world_from_local,
                 z: self.z,
             });
         }
 
         for child in &self.children {
-            child.flatten(world_from_local, out);
+            child.flatten_with_parent_alpha(world_from_local, alpha, out);
         }
     }
 }
@@ -514,7 +575,11 @@ impl Scene2D {
         Self::default()
     }
 
-    pub fn add_root(&mut self, m: Mobject2D) {
+    pub fn add_root(&mut self, mut m: Mobject2D) {
+        // Keep legacy/compat transform in sync on insertion.
+        // This protects older code paths that still read `local_from_parent` directly.
+        m.local_from_parent = m.base_from_parent.mul(m.anim_from_parent);
+
         let idx = self.roots.len();
         self.index.insert(m.name.clone(), idx);
         self.roots.push(m);
